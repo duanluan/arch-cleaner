@@ -1,0 +1,19 @@
+[package]
+name = "arch-cleaner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Interactive and scriptable cleaner for Arch Linux systems"
+readme = "README.md"
+keywords = ["arch", "linux", "cleaner", "pacman", "cli"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "arch_cleaner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arch-cleaner"
+path = "src/main.rs"
+
+[dependencies]
