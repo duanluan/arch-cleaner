@@ -11,6 +11,9 @@ pub struct CleanerOptions {
     pub temp_min_age_days: u16,
     pub user_cache_min_age_days: u16,
     pub ai_agent_min_age_days: u16,
+    pub downloads_min_age_days: u16,
+    pub large_file_min_size: String,
+    pub duplicate_min_size: String,
 }
 
 /// 中英双语文案。规则自带全部语言版本，i18n 模块不再按 id 二次维护。
@@ -38,6 +41,9 @@ impl Default for CleanerOptions {
             temp_min_age_days: 7,
             user_cache_min_age_days: 30,
             ai_agent_min_age_days: 30,
+            downloads_min_age_days: 90,
+            large_file_min_size: "500M".to_string(),
+            duplicate_min_size: "1M".to_string(),
         }
     }
 }
@@ -73,6 +79,7 @@ impl fmt::Display for TargetGroup {
 pub enum RiskLevel {
     Low,
     Medium,
+    High,
 }
 
 impl fmt::Display for RiskLevel {
@@ -80,6 +87,7 @@ impl fmt::Display for RiskLevel {
         match self {
             Self::Low => write!(f, "low"),
             Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
         }
     }
 }

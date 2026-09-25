@@ -28,6 +28,9 @@ Built-in cleanup rules live in [rules/README.md](rules/README.md). The engine in
 | User | Temporary files | `temp-files` | `/var/tmp`, `/tmp` excluding known AI agent scratch prefixes and common runtime directories | Top-level entries older than 7 days |
 | User | Thumbnail cache | `thumbnail-cache` | `$HOME/.cache/thumbnails` | Clear generated thumbnails |
 | System | System crash dumps | `crash-dumps` | `/var/lib/systemd/coredump` | Remove stored coredump files |
+| User | Old downloads | `old-downloads` | `$HOME/Downloads` | Remove old top-level entries (high risk; default 90 days) |
+| User | Large files | `large-files` | `$HOME` | List files over the size threshold (default 500M); picker-only |
+| User | Duplicate files | `duplicate-files` | `$HOME` | Same-content files at or above 1M; one copy per group is kept; picker-only |
 
 ## Build
 
@@ -145,6 +148,9 @@ See [docs/mac-cleaner-cli-analysis.md](docs/mac-cleaner-cli-analysis.md) for the
 --temp-days <n>          Temp file age threshold, default 7
 --user-cache-days <n>    User cache age threshold, default 30
 --ai-agent-days <n>      AI agent cache age threshold, default 30
+--downloads-days <n>     Downloads age threshold, default 90
+--large-file-size <size> Large file threshold, default 500M
+--duplicate-min-size <size> Duplicate scanning minimum size, default 1M
 ```
 
 ## Install Locally

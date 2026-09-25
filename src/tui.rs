@@ -12,9 +12,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::cli::{parse_u8, parse_u16, print_plan, print_results, print_scan_reports};
 use crate::executor::{ExecutionMode, ExecutionOptions, execute_targets};
 use crate::i18n::{self, Language};
-use crate::model::{CleanerOptions, CleanupTarget, ScanItem, ScanReport};
+use crate::model::{CleanerOptions, CleanupTarget, RiskLevel, ScanItem, ScanReport};
 use crate::platform::format_bytes;
-use crate::rules::{all_targets, is_valid_journal_size, item_removal_target, scan_all};
+use crate::rules::{all_targets, is_valid_size_value, item_removal_target, scan_all};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
@@ -31,16 +31,22 @@ enum SettingField {
     TempDays,
     UserCacheDays,
     AiAgentDays,
+    DownloadsDays,
+    LargeFileSize,
+    DuplicateMinSize,
 }
 
 impl SettingField {
-    const ALL: [SettingField; 6] = [
+    const ALL: [SettingField; 9] = [
         Self::KeepPackages,
         Self::JournalDays,
         Self::JournalSize,
         Self::TempDays,
         Self::UserCacheDays,
         Self::AiAgentDays,
+        Self::DownloadsDays,
+        Self::LargeFileSize,
+        Self::DuplicateMinSize,
     ];
 
     fn label(self, language: Language) -> &'static str {
@@ -51,6 +57,9 @@ impl SettingField {
             Self::TempDays => i18n::tr(language, "临时文件天数", "temp file days"),
             Self::UserCacheDays => i18n::tr(language, "用户缓存天数", "user cache days"),
             Self::AiAgentDays => i18n::tr(language, "AI agent 天数", "AI agent days"),
+            Self::DownloadsDays => i18n::tr(language, "下载目录天数", "downloads days"),
+            Self::LargeFileSize => i18n::tr(language, "大文件阈值", "large file size"),
+            Self::DuplicateMinSize => i18n::tr(language, "重复文件下限", "duplicate min size"),
         }
     }
 
@@ -86,6 +95,21 @@ impl SettingField {
                 "用于已知 AI agent 缓存、日志、附件和生成产物的最小保留天数。",
                 "Minimum age for known AI agent caches, logs, attachments, and generated artifacts.",
             ),
+            Self::DownloadsDays => i18n::tr(
+                language,
+                "用于下载目录清理的最小保留天数，风险较高。",
+                "Minimum age for ~/Downloads entries. Higher risk.",
+            ),
+            Self::LargeFileSize => i18n::tr(
+                language,
+                "大文件目标的大小阈值，例如 500M。",
+                "Size threshold for the large-files target, for example 500M.",
+            ),
+            Self::DuplicateMinSize => i18n::tr(
+                language,
+                "重复文件扫描参与的最小大小，例如 1M。",
+                "Minimum size for files to join duplicate scanning, for example 1M.",
+            ),
         }
     }
 
@@ -98,6 +122,11 @@ impl SettingField {
             Self::TempDays => i18n::tr(language, "临时文件", "Temporary files"),
             Self::UserCacheDays => i18n::tr(language, "用户缓存", "User cache"),
             Self::AiAgentDays => i18n::tr(language, "AI agent 缓存", "AI agent caches"),
+            Self::DownloadsDays | Self::LargeFileSize | Self::DuplicateMinSize => i18n::tr(
+                language,
+                "下载目录旧文件 / 大文件 / 重复文件",
+                "Old downloads / Large files / Duplicate files",
+            ),
         }
     }
 }
@@ -189,7 +218,11 @@ impl Session {
     fn new(language: Language) -> Self {
         let options = CleanerOptions::default();
         let targets = all_targets(&options);
-        let selected = vec![true; targets.len()];
+        // 高风险目标默认不勾选：要清理必须显式勾上，或去扫描结果页逐项挑。
+        let selected = targets
+            .iter()
+            .map(|target| !matches!(target.risk, RiskLevel::High))
+            .collect::<Vec<bool>>();
 
         Self {
             page: Page::Targets,
@@ -967,8 +1000,27 @@ impl Session {
             );
         }
 
+        let picker_only: Vec<&CleanupTarget> = selected_targets
+            .iter()
+            .filter(|target| target.apply_commands.is_empty())
+            .collect();
+        let bulk_targets: Vec<CleanupTarget> = selected_targets
+            .iter()
+            .filter(|target| !target.apply_commands.is_empty())
+            .cloned()
+            .collect();
+
+        if !picker_only.is_empty() {
+            let ids = picker_only
+                .iter()
+                .map(|target| target.id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("{}\n", i18n::picker_only_hint(self.language, &ids));
+        }
+
         print_plan(
-            &selected_targets,
+            &bulk_targets,
             ExecutionMode::Apply,
             &self.options,
             self.language,
@@ -1074,7 +1126,7 @@ impl Session {
                     parse_u16(field.label(self.language), value, self.language)?;
             }
             SettingField::JournalSize => {
-                if !is_valid_journal_size(value) {
+                if !is_valid_size_value(value) {
                     return Err(i18n::invalid_size_value(
                         self.language,
                         field.label(self.language),
@@ -1094,6 +1146,30 @@ impl Session {
             SettingField::AiAgentDays => {
                 self.options.ai_agent_min_age_days =
                     parse_u16(field.label(self.language), value, self.language)?;
+            }
+            SettingField::DownloadsDays => {
+                self.options.downloads_min_age_days =
+                    parse_u16(field.label(self.language), value, self.language)?;
+            }
+            SettingField::LargeFileSize => {
+                if !is_valid_size_value(value) {
+                    return Err(i18n::invalid_size_value(
+                        self.language,
+                        field.label(self.language),
+                        value,
+                    ));
+                }
+                self.options.large_file_min_size = value.trim().to_string();
+            }
+            SettingField::DuplicateMinSize => {
+                if !is_valid_size_value(value) {
+                    return Err(i18n::invalid_size_value(
+                        self.language,
+                        field.label(self.language),
+                        value,
+                    ));
+                }
+                self.options.duplicate_min_size = value.trim().to_string();
             }
         }
 
@@ -1134,6 +1210,28 @@ impl Session {
                 let value = self.options.ai_agent_min_age_days as i32 + delta as i32;
                 self.options.ai_agent_min_age_days = value.clamp(1, 3650) as u16;
             }
+            SettingField::DownloadsDays => {
+                let value = self.options.downloads_min_age_days as i32 + delta as i32;
+                self.options.downloads_min_age_days = value.clamp(1, 3650) as u16;
+            }
+            SettingField::LargeFileSize => {
+                if delta >= 0 {
+                    self.options.large_file_min_size =
+                        bump_size_up(&self.options.large_file_min_size);
+                } else {
+                    self.options.large_file_min_size =
+                        bump_size_down(&self.options.large_file_min_size);
+                }
+            }
+            SettingField::DuplicateMinSize => {
+                if delta >= 0 {
+                    self.options.duplicate_min_size =
+                        bump_size_up(&self.options.duplicate_min_size);
+                } else {
+                    self.options.duplicate_min_size =
+                        bump_size_down(&self.options.duplicate_min_size);
+                }
+            }
         }
 
         self.refresh_targets();
@@ -1152,6 +1250,9 @@ impl Session {
             SettingField::TempDays => self.options.temp_min_age_days.to_string(),
             SettingField::UserCacheDays => self.options.user_cache_min_age_days.to_string(),
             SettingField::AiAgentDays => self.options.ai_agent_min_age_days.to_string(),
+            SettingField::DownloadsDays => self.options.downloads_min_age_days.to_string(),
+            SettingField::LargeFileSize => self.options.large_file_min_size.clone(),
+            SettingField::DuplicateMinSize => self.options.duplicate_min_size.clone(),
         }
     }
 

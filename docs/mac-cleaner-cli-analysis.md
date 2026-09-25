@@ -20,6 +20,7 @@ Reference: https://github.com/guhcostan/mac-cleaner-cli, read from local clone a
 - Kept the existing command-oriented cleanup plan, because Arch system cleanup is easier to audit when the exact `pacman`, `journalctl`, and `find` commands remain visible.
 - Fixed pacman cache dry-run to use one valid `paccache` operation: `paccache -d -k N`. The previous `-d -r` combination is rejected by `paccache`.
 - Pacman scan now asks `paccache` for its own dry-run summary and uses that as the cleanable estimate. The scan reuses the exact argv of the dry-run command shown in the plan (only the locale is pinned), so the estimate always describes the command the user sees.
+- Risky categories shipped with item-level review: old downloads (`old-downloads`), large files (`large-files`), and content-hashed duplicates (`duplicate-files`). All three are High risk: TUI starts them unchecked, large-files/duplicate-files are picker-only (no bulk apply), and duplicates keep one copy per group by default.
 - File picker, first slice: scan reports now carry typed per-item paths (`items` in text details, JSON, and the TUI). The TUI scan results page lets the user toggle individual entries and clean only the selection; each removal is an explicit `rm -rf -- <path>` argv command. Risky categories (downloads, duplicates, large files) remain out until they ship with per-item review.
 - Rule metadata is single-source: each rule entry in `rules/mod.rs` owns its id, localized title/description, threshold summary, scan function, and commands. `--help`, `list-targets`, TUI, and JSON all render from the registry; a test keeps the README target table in sync.
 
@@ -27,5 +28,4 @@ Reference: https://github.com/guhcostan/mac-cleaner-cli, read from local clone a
 
 - File picker for every target: the item model is in place for path-based targets; remaining work is item paths for query-driven targets such as pacman cache and orphan packages.
 - Backup/restore: useful for user-file cleanup, but current targets focus on caches and system commands. Adding backups now would add state and failure modes unrelated to this release.
-- Risky categories such as downloads, duplicate files, and large files: these need item-level review and should not be added without a dedicated selection UI.
 - App uninstall and maintenance tasks: these are separate workflows, not cleanup targets for this Arch-focused tool.

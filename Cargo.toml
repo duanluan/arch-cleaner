@@ -17,6 +17,7 @@ name = "arch-cleaner"
 path = "src/main.rs"
 
 [dependencies]
+sha2 = "0.10"
 crossterm = "0.29"
 unicode-width = "0.2"
 

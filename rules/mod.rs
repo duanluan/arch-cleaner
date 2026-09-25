@@ -1,9 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
 
 use crate::i18n::{self, Language};
 use crate::model::{
@@ -25,6 +27,9 @@ pub fn all_targets(options: &CleanerOptions) -> Vec<CleanupTarget> {
         temporary_files(options),
         thumbnail_cache(),
         crash_dumps(),
+        old_downloads(options),
+        large_files(options),
+        duplicate_files(options),
     ]
 }
 
@@ -217,10 +222,162 @@ fn orphan_packages() -> CleanupTarget {
     }
 }
 
-/// journalctl `--vacuum-size` 接受 `500M`、`1G` 这类大小（无后缀按字节）。
-/// CLI 和 TUI 在入口处用它统一校验，坏值在拼进命令前就报错，
-/// 而不是延迟到 journalctl 运行时才失败。
-pub fn is_valid_journal_size(value: &str) -> bool {
+fn old_downloads(options: &CleanerOptions) -> CleanupTarget {
+    let downloads_dir = home_dir()
+        .map(|path| path.join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("$HOME/Downloads"));
+    let dir_arg = downloads_dir.to_string_lossy().to_string();
+    let display_path = path_display(&downloads_dir);
+    let min_age = format!("+{}", options.downloads_min_age_days);
+
+    CleanupTarget {
+        id: "old-downloads",
+        title: LocalizedText {
+            zh_cn: "下载目录旧文件",
+            en: "Old downloads",
+        },
+        description: LocalizedText {
+            zh_cn: "清理下载目录中较旧的顶层条目。风险较高：建议在扫描结果页逐项勾选后清理。",
+            en: "Remove old top-level entries from ~/Downloads. Higher risk: prefer reviewing entries one by one in the scan results page.",
+        },
+        group: TargetGroup::User,
+        risk: RiskLevel::High,
+        requires_sudo: false,
+        threshold_summary: |options: &CleanerOptions, language: Language| {
+            i18n::tr_owned(
+                language,
+                format!("未变化 {} 天以上", options.downloads_min_age_days),
+                format!("Unchanged for {}+ days", options.downloads_min_age_days),
+            )
+        },
+        scan: scan_old_downloads,
+        dry_run_commands: vec![CleanupCommand::new(
+            format!("find {display_path} -xdev -mindepth 1 -maxdepth 1 -mtime {min_age} -print"),
+            "find",
+            [
+                dir_arg.as_str(),
+                "-xdev",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-mtime",
+                min_age.as_str(),
+                "-print",
+            ],
+            false,
+        )],
+        apply_commands: vec![CleanupCommand::new(
+            format!(
+                "find {display_path} -xdev -mindepth 1 -maxdepth 1 -mtime {min_age} -exec rm -rf -- {{}} +"
+            ),
+            "find",
+            [
+                dir_arg.as_str(),
+                "-xdev",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-mtime",
+                min_age.as_str(),
+                "-exec",
+                "rm",
+                "-rf",
+                "--",
+                "{}",
+                "+",
+            ],
+            false,
+        )],
+    }
+}
+
+fn large_files(options: &CleanerOptions) -> CleanupTarget {
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("$HOME"));
+    let display_path = path_display(&home);
+    let min_bytes = parse_size_option(&options.large_file_min_size, 500 * 1024 * 1024);
+    let size_arg = format!("+{min_bytes}c");
+    let printf_format = "%s\t%p\n";
+
+    CleanupTarget {
+        id: "large-files",
+        title: LocalizedText {
+            zh_cn: "大文件",
+            en: "Large files",
+        },
+        description: LocalizedText {
+            zh_cn: "找出 home 目录下超过大小阈值的文件。此目标不提供整批删除，请在扫描结果页逐项勾选后清理。",
+            en: "Find files under the home directory larger than the threshold. No bulk delete: review and clean entries one by one in the scan results page.",
+        },
+        group: TargetGroup::User,
+        risk: RiskLevel::High,
+        requires_sudo: false,
+        threshold_summary: |options: &CleanerOptions, language: Language| {
+            i18n::tr_owned(
+                language,
+                format!("大于 {}", options.large_file_min_size),
+                format!("Larger than {}", options.large_file_min_size),
+            )
+        },
+        scan: scan_large_files,
+        // 逐项清理专用：不提供整批 apply，删除一律走扫描结果页的逐条
+        // `rm -rf -- <path>` 命令。
+        dry_run_commands: vec![CleanupCommand::new(
+            format!("find {display_path} -xdev -type f -size {size_arg} -printf '%s\t%p\n'"),
+            "find",
+            [
+                home.to_string_lossy().as_ref(),
+                "-xdev",
+                "-type",
+                "f",
+                "-size",
+                size_arg.as_str(),
+                "-printf",
+                printf_format,
+            ],
+            false,
+        )],
+        apply_commands: Vec::new(),
+    }
+}
+
+fn duplicate_files(_options: &CleanerOptions) -> CleanupTarget {
+    CleanupTarget {
+        id: "duplicate-files",
+        title: LocalizedText {
+            zh_cn: "重复文件",
+            en: "Duplicate files",
+        },
+        description: LocalizedText {
+            zh_cn: "按内容哈希找出 home 目录下不小于阈值的重复文件，每组保留一份、其余列为可删候选。请在扫描结果页逐项勾选后清理。",
+            en: "Find files with identical content (hashed) at or above the size threshold under the home directory; one copy per group is kept and the rest are listed. Clean entries one by one in the scan results page.",
+        },
+        group: TargetGroup::User,
+        risk: RiskLevel::High,
+        requires_sudo: false,
+        threshold_summary: |options: &CleanerOptions, language: Language| {
+            i18n::tr_owned(
+                language,
+                format!("不小于 {} 且内容相同", options.duplicate_min_size),
+                format!("Identical content at least {}", options.duplicate_min_size),
+            )
+        },
+        scan: scan_duplicate_files,
+        dry_run_commands: Vec::new(),
+        apply_commands: Vec::new(),
+    }
+}
+
+/// 大小选项转字节；非法值（绕过入口校验直接改库的调用方）回退默认值。
+fn parse_size_option(value: &str, fallback: u64) -> u64 {
+    parse_human_bytes(value).unwrap_or(fallback)
+}
+
+/// 大小类选项（journal-size、large-file-size、duplicate-min-size）的统一校验：
+/// 接受 `500M`、`1G` 这类写法（无后缀按字节）。CLI 和 TUI 在入口处统一拦截，
+/// 坏值在拼进命令前就报错，而不是延迟到工具运行时才失败。
+pub fn is_valid_size_value(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || !value.starts_with(|character: char| character.is_ascii_digit()) {
         return false;
@@ -1438,6 +1595,359 @@ fn cleanable_files_size(path: &Path, min_age_days: u16) -> io::Result<ScanItem> 
     })
 }
 
+fn scan_old_downloads(
+    target: &CleanupTarget,
+    options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+    let Some(downloads_dir) = home_dir().map(|path| path.join("Downloads")) else {
+        report.status = ScanStatus::Unavailable;
+        report
+            .warnings
+            .push(i18n::tr(language, "未设置 HOME。", "HOME is not set.").to_string());
+        return report;
+    };
+
+    match top_level_cleanable_entries(
+        &downloads_dir,
+        options.downloads_min_age_days,
+        false,
+        |_| false,
+    ) {
+        Ok(entries) => add_cleanable_entry_details(&mut report, entries, language),
+        Err(error) => push_inspect_warning(&mut report, error, language),
+    }
+
+    report.details.push(
+        i18n::tr(
+            language,
+            "下载目录删除后无法从系统恢复，请逐项确认。",
+            "Downloads cannot be restored by system tooling; review entries carefully.",
+        )
+        .to_string(),
+    );
+    report
+}
+
+fn scan_large_files(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+    let Some(_home) = home_dir() else {
+        report.status = ScanStatus::Unavailable;
+        report
+            .warnings
+            .push(i18n::tr(language, "未设置 HOME。", "HOME is not set.").to_string());
+        return report;
+    };
+
+    // 扫描直接运行计划里展示的那条 find 命令（钉 locale），解析
+    // `-printf '%s\t%p\n'` 的输出；条目上限防止报告失控。
+    let Some(dry_run) = target.dry_run_commands.first() else {
+        report.status = ScanStatus::Unavailable;
+        return report;
+    };
+    let args: Vec<&str> = dry_run.args.iter().map(String::as_str).collect();
+    match run_capture_with_env(
+        &dry_run.program,
+        &args,
+        &[("LC_ALL", "C"), ("LANG", "C"), ("LANGUAGE", "C")],
+    ) {
+        Ok(output) => {
+            let text = output_text(&output);
+            // find/bfs 碰到无权限目录会以非零码退出，但已列出的结果仍然
+            // 有效：有输出按部分成功处理，仅在完全没结果时报不可用。
+            if !output.status.success() && text.is_empty() {
+                report.status = ScanStatus::Unavailable;
+                report.warnings.push(format!(
+                    "{}: {text}",
+                    i18n::tr(
+                        language,
+                        "无法枚举大文件",
+                        "Could not enumerate large files"
+                    )
+                ));
+                return report;
+            }
+            if !output.status.success() {
+                report.warnings.push(
+                    i18n::tr(
+                        language,
+                        "部分目录无权限，结果可能不完整。",
+                        "Some directories were unreadable; results may be incomplete.",
+                    )
+                    .to_string(),
+                );
+            }
+
+            let mut items = parse_size_path_lines(&text);
+            items.sort_by_key(|item| std::cmp::Reverse(item.bytes));
+            let total = items
+                .iter()
+                .fold(0u64, |sum, item| sum.saturating_add(item.bytes));
+            let count = items.len();
+            let shown = items.len().min(LARGE_FILE_ITEM_LIMIT);
+            report.details.push(format!(
+                "{}: {count} ({})",
+                i18n::tr(language, "大文件", "Large files"),
+                format_bytes(total)
+            ));
+            if shown < count {
+                report.details.push(format!(
+                    "{}: {}",
+                    i18n::tr(language, "列表已截断", "List truncated to"),
+                    shown
+                ));
+            }
+            report.estimated_bytes = Some(total);
+            report.estimated_items = Some(count);
+            report.items = items.into_iter().take(LARGE_FILE_ITEM_LIMIT).collect();
+        }
+        Err(error) => {
+            report.status = ScanStatus::Unavailable;
+            report.warnings.push(format!(
+                "{}: {error}",
+                i18n::tr(
+                    language,
+                    "无法枚举大文件",
+                    "Could not enumerate large files"
+                )
+            ));
+        }
+    }
+
+    report
+}
+
+/// 解析 `find -printf '%s\t%p\n'` 输出：`<字节数>\t<路径>` 每行一条。
+fn parse_size_path_lines(text: &str) -> Vec<ScanItem> {
+    text.lines()
+        .filter_map(|line| {
+            let (size_text, path_text) = line.split_once('\t')?;
+            let bytes = size_text.trim().parse::<u64>().ok()?;
+            if path_text.is_empty() {
+                return None;
+            }
+            Some(ScanItem {
+                path: PathBuf::from(path_text),
+                bytes,
+                entries: 1,
+            })
+        })
+        .collect()
+}
+
+/// 大文件列表上限：报告和结果页保持可读，完整清单用 `scan --json` 看。
+const LARGE_FILE_ITEM_LIMIT: usize = 50;
+
+/// 重复文件扫描参与的文件数上限，防止在巨型 home 目录上把扫描拖死。
+const DUPLICATE_FILE_BUDGET: usize = 50_000;
+/// 超过该大小的文件不参与哈希（读一遍代价太大）。
+const DUPLICATE_HASH_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// 单次扫描的哈希读取总量预算：超出后剩余候选跳过并告警。
+const DUPLICATE_HASH_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+fn scan_duplicate_files(
+    target: &CleanupTarget,
+    options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+    let Some(home) = home_dir() else {
+        report.status = ScanStatus::Unavailable;
+        report
+            .warnings
+            .push(i18n::tr(language, "未设置 HOME。", "HOME is not set.").to_string());
+        return report;
+    };
+
+    let min_bytes = parse_size_option(&options.duplicate_min_size, 1024 * 1024);
+    let (candidates, capped) = home_files_at_least(&home, min_bytes, DUPLICATE_FILE_BUDGET);
+    if capped {
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "文件数超过扫描预算，重复文件结果不完整。",
+                "File count exceeded the scan budget; duplicate results are incomplete.",
+            )
+            .to_string(),
+        );
+    }
+
+    // 先按大小分组，只有大小相同的文件才可能内容相同；再对候选做
+    // SHA-256 分组，避免哈希所有文件。
+    let mut by_size: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+    for (path, bytes) in &candidates {
+        if *bytes <= DUPLICATE_HASH_MAX_BYTES {
+            by_size.entry(*bytes).or_default().push(path.clone());
+        }
+    }
+
+    // 从小到大哈希，读取总量有预算：超预算的候选跳过并告警，
+    // 保证预算内的结果确定、扫描不会在巨型目录上拖死。
+    let mut hashed: Vec<(PathBuf, u64, String)> = Vec::new();
+    let mut hashed_bytes = 0u64;
+    let mut over_budget = false;
+    for (bytes, paths) in by_size {
+        if paths.len() < 2 {
+            continue;
+        }
+        for path in paths {
+            if hashed_bytes.saturating_add(bytes) > DUPLICATE_HASH_BUDGET_BYTES {
+                over_budget = true;
+                continue;
+            }
+            if let Some(digest) = file_sha256(&path) {
+                hashed.push((path, bytes, digest));
+                hashed_bytes = hashed_bytes.saturating_add(bytes);
+            }
+        }
+    }
+    if over_budget {
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "哈希读取超过预算，部分候选未参与比对。",
+                "Hashing exceeded its read budget; some candidates were skipped.",
+            )
+            .to_string(),
+        );
+    }
+
+    let items = redundant_items_from_hashed(&hashed);
+    let groups = hashed_group_count(&hashed);
+    let total = items
+        .iter()
+        .fold(0u64, |sum, item| sum.saturating_add(item.bytes));
+
+    report.details.push(format!(
+        "{}: {groups}",
+        i18n::tr(language, "重复组", "Duplicate groups")
+    ));
+    report.details.push(format!(
+        "{}: {} ({})",
+        i18n::tr(language, "可释放", "Reclaimable"),
+        items.len(),
+        format_bytes(total)
+    ));
+    report.estimated_items = Some(items.len());
+    report.estimated_bytes = Some(total);
+    report.items = items;
+    report
+}
+
+/// 遍历 home 下（不跨设备、不跟符号链接）大小达标的所有普通文件。
+fn home_files_at_least(root: &Path, min_bytes: u64, budget: usize) -> (Vec<(PathBuf, u64)>, bool) {
+    let mut files = Vec::new();
+    let mut capped = false;
+    let Ok(root_metadata) = fs::symlink_metadata(root) else {
+        return (files, capped);
+    };
+    let root_dev = root_metadata.dev();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.dev() != root_dev {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if files.len() >= budget {
+                capped = true;
+                return (files, capped);
+            }
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.len() >= min_bytes {
+                files.push((path, metadata.len()));
+            }
+        }
+    }
+
+    (files, capped)
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// 按内容哈希分组后，每组（路径字典序）保留第一份，其余列为可删候选。
+/// 纯函数，便于测试。
+fn redundant_items_from_hashed(hashed: &[(PathBuf, u64, String)]) -> Vec<ScanItem> {
+    let mut groups: BTreeMap<(u64, String), Vec<PathBuf>> = BTreeMap::new();
+    for (path, bytes, digest) in hashed {
+        groups
+            .entry((*bytes, digest.clone()))
+            .or_default()
+            .push(path.clone());
+    }
+
+    let mut items = Vec::new();
+    for ((bytes, _), mut paths) in groups {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort();
+        for path in paths.into_iter().skip(1) {
+            items.push(ScanItem {
+                path,
+                bytes,
+                entries: 1,
+            });
+        }
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item.bytes));
+    items
+}
+
+fn hashed_group_count(hashed: &[(PathBuf, u64, String)]) -> usize {
+    let mut groups: HashSet<(u64, String)> = HashSet::new();
+    for (_, bytes, digest) in hashed {
+        groups.insert((*bytes, digest.clone()));
+    }
+    // 单文件不成组
+    let mut counts: BTreeMap<(u64, String), usize> = BTreeMap::new();
+    for (_, bytes, digest) in hashed {
+        *counts.entry((*bytes, digest.clone())).or_default() += 1;
+    }
+    counts.values().filter(|count| **count > 1).count()
+}
+
 fn add_cleanable_entry_details(
     report: &mut ScanReport,
     mut entries: Vec<ScanItem>,
@@ -1535,7 +2045,7 @@ fn add_dir_size(report: &mut ScanReport, path: &Path, label: &str, language: Lan
 #[cfg(test)]
 mod tests {
     use super::{
-        all_targets, is_valid_journal_size, matches_ai_agent_temp_entry, matches_find_mtime_plus,
+        all_targets, is_valid_size_value, matches_ai_agent_temp_entry, matches_find_mtime_plus,
         matches_temp_file_excluded_entry, matches_user_cache_excluded_name,
     };
     use crate::i18n::Language;
@@ -1583,6 +2093,43 @@ mod tests {
                 target.id
             );
         }
+    }
+
+    #[test]
+    fn redundant_items_keep_one_copy_per_group() {
+        use std::path::PathBuf;
+
+        let hashed = vec![
+            (PathBuf::from("/b"), 10u64, "h1".to_string()),
+            (PathBuf::from("/a"), 10, "h1".to_string()),
+            (PathBuf::from("/c"), 10, "h1".to_string()),
+            (PathBuf::from("/d"), 20, "h2".to_string()),
+            (PathBuf::from("/e"), 20, "h2".to_string()),
+            (PathBuf::from("/f"), 30, "h3".to_string()), // 唯一文件不成组
+        ];
+        let items = super::redundant_items_from_hashed(&hashed);
+
+        // 每组按路径排序保留第一份：h1 组保留 /a，h2 组保留 /d。
+        let paths: Vec<String> = items
+            .iter()
+            .map(|item| item.path.display().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/e".to_string(), "/b".to_string(), "/c".to_string()]
+        );
+        assert!(items.iter().all(|item| item.entries == 1));
+    }
+
+    #[test]
+    fn parses_find_size_path_lines() {
+        let text = "1024\t/tmp/with space\nf\n4096\t/tmp/other\nnot-a-line\n";
+        let items = super::parse_size_path_lines(text);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].path.display().to_string(), "/tmp/with space");
+        assert_eq!(items[0].bytes, 1024);
+        assert_eq!(items[1].bytes, 4096);
     }
 
     #[test]
@@ -1634,10 +2181,10 @@ mod tests {
     #[test]
     fn journal_size_validation_accepts_systemd_units() {
         for value in ["1G", "500M", "10K", "1024", "1.5G", "2 TiB", "3gb"] {
-            assert!(is_valid_journal_size(value), "{value} should be valid");
+            assert!(is_valid_size_value(value), "{value} should be valid");
         }
         for value in ["", "G", "1x", "1..5G", "1.", "-1G", "abc"] {
-            assert!(!is_valid_journal_size(value), "{value} should be invalid");
+            assert!(!is_valid_size_value(value), "{value} should be invalid");
         }
     }
 

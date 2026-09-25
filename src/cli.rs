@@ -9,7 +9,7 @@ use crate::i18n::{self, Language};
 use crate::json as json_output;
 use crate::model::{CleanerOptions, CleanupTarget, ScanReport, ScanStatus, TargetGroup};
 use crate::platform::format_bytes;
-use crate::rules::{all_targets, is_valid_journal_size, scan_all};
+use crate::rules::{all_targets, is_valid_size_value, scan_all};
 use crate::tui;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -137,7 +137,7 @@ where
 /// 把 `--targets` 这类 `--flag=value` 写法拆成两个参数，主循环就只需要
 /// 维护一份 `--flag value` 形式的清单。
 fn split_inline_values(args: &[String]) -> Vec<String> {
-    const VALUE_FLAGS: [&str; 7] = [
+    const VALUE_FLAGS: [&str; 10] = [
         "--targets",
         "--keep-packages",
         "--journal-days",
@@ -145,6 +145,9 @@ fn split_inline_values(args: &[String]) -> Vec<String> {
         "--temp-days",
         "--user-cache-days",
         "--ai-agent-days",
+        "--downloads-days",
+        "--large-file-size",
+        "--duplicate-min-size",
     ];
 
     let mut expanded = Vec::with_capacity(args.len() + 2);
@@ -521,7 +524,7 @@ fn parse_run_options(raw_args: &[String], language: Language) -> Result<RunOptio
             }
             "--journal-size" => {
                 index += 1;
-                options.cleaner.journal_size = parse_journal_size(
+                options.cleaner.journal_size = parse_size_value(
                     "--journal-size",
                     require_value(&args, index, "--journal-size", language)?,
                     language,
@@ -548,6 +551,30 @@ fn parse_run_options(raw_args: &[String], language: Language) -> Result<RunOptio
                 options.cleaner.ai_agent_min_age_days = parse_u16(
                     "--ai-agent-days",
                     require_value(&args, index, "--ai-agent-days", language)?,
+                    language,
+                )?;
+            }
+            "--downloads-days" => {
+                index += 1;
+                options.cleaner.downloads_min_age_days = parse_u16(
+                    "--downloads-days",
+                    require_value(&args, index, "--downloads-days", language)?,
+                    language,
+                )?;
+            }
+            "--large-file-size" => {
+                index += 1;
+                options.cleaner.large_file_min_size = parse_size_value(
+                    "--large-file-size",
+                    require_value(&args, index, "--large-file-size", language)?,
+                    language,
+                )?;
+            }
+            "--duplicate-min-size" => {
+                index += 1;
+                options.cleaner.duplicate_min_size = parse_size_value(
+                    "--duplicate-min-size",
+                    require_value(&args, index, "--duplicate-min-size", language)?,
                     language,
                 )?;
             }
@@ -623,8 +650,8 @@ pub(crate) fn parse_u16(flag: &str, value: &str, language: Language) -> Result<u
         .map_err(|_| i18n::invalid_integer(language, flag, value))
 }
 
-fn parse_journal_size(flag: &str, value: &str, language: Language) -> Result<String, String> {
-    if is_valid_journal_size(value) {
+fn parse_size_value(flag: &str, value: &str, language: Language) -> Result<String, String> {
+    if is_valid_size_value(value) {
         Ok(value.to_string())
     } else {
         Err(i18n::invalid_size_value(language, flag, value))
@@ -655,10 +682,10 @@ fn help_text(language: Language, version: &str) -> String {
         .join(", ");
     match language {
         Language::ZhCn => format!(
-            "arch-cleaner {version}\n\n用法:\n    arch-cleaner                  启动交互式 TUI 菜单\n    arch-cleaner tui              启动交互式 TUI 菜单\n    arch-cleaner list-targets     显示清理目标\n    arch-cleaner scan [OPTIONS]   检查选中的目标\n    arch-cleaner clean [OPTIONS]  显示或执行清理计划\n\n选项:\n    -V, --version                 显示版本号\n    --lang, -l <zh|en>            界面语言 [默认: zh]\n    --targets <ids>               以逗号分隔的目标 ID，或 all\n    --apply                       执行清理命令\n    --yes, -y                     跳过 --apply 的确认提示\n    --run-readonly-checks         在 dry-run 模式下运行只读命令\n    --json                        输出机器可读 JSON\n    --keep-packages <n>           Pacman 包版本保留数量 [默认: 3]\n    --journal-days <n>            日志清理天数阈值 [默认: 14]\n    --journal-size <size>         日志清理大小阈值 [默认: 1G]\n    --temp-days <n>               临时文件保留天数 [默认: 7]\n    --user-cache-days <n>         用户缓存保留天数 [默认: 30]\n    --ai-agent-days <n>           AI agent 缓存保留天数 [默认: 30]\n\n说明:\n    在 TUI 中按 Tab 进入设置页，按 Ctrl+L 切换语言。\n\n目标:\n    {targets}"
+            "arch-cleaner {version}\n\n用法:\n    arch-cleaner                  启动交互式 TUI 菜单\n    arch-cleaner tui              启动交互式 TUI 菜单\n    arch-cleaner list-targets     显示清理目标\n    arch-cleaner scan [OPTIONS]   检查选中的目标\n    arch-cleaner clean [OPTIONS]  显示或执行清理计划\n\n选项:\n    -V, --version                 显示版本号\n    --lang, -l <zh|en>            界面语言 [默认: zh]\n    --targets <ids>               以逗号分隔的目标 ID，或 all\n    --apply                       执行清理命令\n    --yes, -y                     跳过 --apply 的确认提示\n    --run-readonly-checks         在 dry-run 模式下运行只读命令\n    --json                        输出机器可读 JSON\n    --keep-packages <n>           Pacman 包版本保留数量 [默认: 3]\n    --journal-days <n>            日志清理天数阈值 [默认: 14]\n    --journal-size <size>         日志清理大小阈值 [默认: 1G]\n    --temp-days <n>               临时文件保留天数 [默认: 7]\n    --user-cache-days <n>         用户缓存保留天数 [默认: 30]\n    --ai-agent-days <n>           AI agent 缓存保留天数 [默认: 30]\n    --downloads-days <n>          下载目录保留天数 [默认: 90]\n    --large-file-size <size>      大文件阈值 [默认: 500M]\n    --duplicate-min-size <size>   重复文件最小大小 [默认: 1M]\n\n说明:\n    在 TUI 中按 Tab 进入设置页，按 Ctrl+L 切换语言。\n\n目标:\n    {targets}"
         ),
         Language::En => format!(
-            "arch-cleaner {version}\n\nUSAGE:\n    arch-cleaner                  Start the interactive TUI menu\n    arch-cleaner tui              Start the interactive TUI menu\n    arch-cleaner list-targets     Show cleanup targets\n    arch-cleaner scan [OPTIONS]   Inspect selected targets\n    arch-cleaner clean [OPTIONS]  Show or execute a cleanup plan\n\nOPTIONS:\n    -V, --version                 Print version\n    --lang, -l <zh|en>            UI language [default: zh]\n    --targets <ids>               Comma-separated target ids, or all\n    --apply                       Execute cleanup commands\n    --yes, -y                     Skip confirmation prompts for --apply\n    --run-readonly-checks         In dry-run mode, run read-only commands\n    --json                        Print machine-readable JSON\n    --keep-packages <n>           Pacman package versions to keep [default: 3]\n    --journal-days <n>            Journal age vacuum threshold [default: 14]\n    --journal-size <size>         Journal size vacuum threshold [default: 1G]\n    --temp-days <n>               Temp file age threshold [default: 7]\n    --user-cache-days <n>         User cache age threshold [default: 30]\n    --ai-agent-days <n>           AI agent cache age threshold [default: 30]\n\nNOTES:\n    Press Tab in the TUI to open settings and Ctrl+L to switch languages.\n\nTARGETS:\n    {targets}"
+            "arch-cleaner {version}\n\nUSAGE:\n    arch-cleaner                  Start the interactive TUI menu\n    arch-cleaner tui              Start the interactive TUI menu\n    arch-cleaner list-targets     Show cleanup targets\n    arch-cleaner scan [OPTIONS]   Inspect selected targets\n    arch-cleaner clean [OPTIONS]  Show or execute a cleanup plan\n\nOPTIONS:\n    -V, --version                 Print version\n    --lang, -l <zh|en>            UI language [default: zh]\n    --targets <ids>               Comma-separated target ids, or all\n    --apply                       Execute cleanup commands\n    --yes, -y                     Skip confirmation prompts for --apply\n    --run-readonly-checks         In dry-run mode, run read-only commands\n    --json                        Print machine-readable JSON\n    --keep-packages <n>           Pacman package versions to keep [default: 3]\n    --journal-days <n>            Journal age vacuum threshold [default: 14]\n    --journal-size <size>         Journal size vacuum threshold [default: 1G]\n    --temp-days <n>               Temp file age threshold [default: 7]\n    --user-cache-days <n>         User cache age threshold [default: 30]\n    --ai-agent-days <n>           AI agent cache age threshold [default: 30]\n    --downloads-days <n>          Downloads age threshold [default: 90]\n    --large-file-size <size>      Large file threshold [default: 500M]\n    --duplicate-min-size <size>   Duplicate file minimum size [default: 1M]\n\nNOTES:\n    Press Tab in the TUI to open settings and Ctrl+L to switch languages.\n\nTARGETS:\n    {targets}"
         ),
     }
 }

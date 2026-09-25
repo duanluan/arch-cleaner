@@ -67,6 +67,7 @@ pub fn risk_label(language: Language, risk: RiskLevel) -> &'static str {
     match risk {
         RiskLevel::Low => tr(language, "低", "low"),
         RiskLevel::Medium => tr(language, "中", "medium"),
+        RiskLevel::High => tr(language, "高", "high"),
     }
 }
 
@@ -113,6 +114,16 @@ pub fn no_targets_selected(language: Language) -> &'static str {
 
 pub fn no_items_selected(language: Language) -> &'static str {
     tr(language, "没有勾选任何条目。", "No items selected.")
+}
+
+pub fn picker_only_hint(language: Language, ids: &str) -> String {
+    tr_owned(
+        language,
+        format!("以下目标不整批删除，请在扫描结果页逐项勾选后清理：{ids}"),
+        format!(
+            "These targets have no bulk delete; clean them entry by entry in the scan results page: {ids}"
+        ),
+    )
 }
 
 pub fn results_help_line(language: Language) -> &'static str {
