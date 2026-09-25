@@ -83,11 +83,62 @@ pub fn run_capture(program: &str, args: &[&str]) -> io::Result<Output> {
     Command::new(program).args(args).output()
 }
 
+pub fn run_capture_with_env(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> io::Result<Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output()
+}
+
 pub fn output_text(output: &Output) -> String {
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output.stdout));
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     text.trim().to_string()
+}
+
+/// 解析外部工具输出里的大小（如 `1.5 GiB`、`4G`、`1,024.0 MiB`）。
+/// 供规则解析 paccache / journalctl 的摘要行使用。
+pub fn parse_human_bytes(value: &str) -> Option<u64> {
+    let value = value.trim().trim_end_matches('.').replace(',', "");
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut number_end = 0usize;
+    for (index, character) in value.char_indices() {
+        if character.is_ascii_digit() || character == '.' {
+            number_end = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let number = value[..number_end].trim();
+    let unit = value[number_end..]
+        .trim()
+        .replace(' ', "")
+        .to_ascii_uppercase();
+    let amount = number.parse::<f64>().ok()?;
+
+    let multiplier = match unit.as_str() {
+        "" | "B" => 1f64,
+        "K" | "KB" | "KIB" => 1024f64,
+        "M" | "MB" | "MIB" => 1024f64.powi(2),
+        "G" | "GB" | "GIB" => 1024f64.powi(3),
+        "T" | "TB" | "TIB" => 1024f64.powi(4),
+        "P" | "PB" | "PIB" => 1024f64.powi(5),
+        "E" | "EB" | "EIB" => 1024f64.powi(6),
+        _ => return None,
+    };
+
+    Some((amount * multiplier).round() as u64)
 }
 
 pub fn count_non_empty_lines(text: &str) -> usize {
@@ -115,7 +166,7 @@ fn is_ignorable_io_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_non_empty_lines, format_bytes};
+    use super::{count_non_empty_lines, format_bytes, parse_human_bytes};
 
     #[test]
     fn formats_bytes_with_binary_units() {
@@ -128,5 +179,13 @@ mod tests {
     #[test]
     fn counts_only_non_empty_lines() {
         assert_eq!(count_non_empty_lines("a\n\n b \n"), 2);
+    }
+
+    #[test]
+    fn parses_compact_human_bytes() {
+        assert_eq!(parse_human_bytes("1.5 GiB"), Some(1_610_612_736));
+        assert_eq!(parse_human_bytes("4G"), Some(4_294_967_296));
+        assert_eq!(parse_human_bytes("1,024.0 MiB"), Some(1_073_741_824));
+        assert_eq!(parse_human_bytes("wat"), None);
     }
 }
