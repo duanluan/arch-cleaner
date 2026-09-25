@@ -111,6 +111,18 @@ pub fn no_targets_selected(language: Language) -> &'static str {
     tr(language, "没有选中的目标。", "No targets selected.")
 }
 
+pub fn no_items_selected(language: Language) -> &'static str {
+    tr(language, "没有勾选任何条目。", "No items selected.")
+}
+
+pub fn results_help_line(language: Language) -> &'static str {
+    tr(
+        language,
+        "方向键移动 | 空格勾选 | c 清理勾选项 | a/n 全选/全不选 | Tab 返回",
+        "Arrows move | Space toggle | c clean selected | a/n all/none | Tab back",
+    )
+}
+
 pub fn scan_skipped(language: Language) -> &'static str {
     tr(language, "已跳过扫描。", "Scan skipped.")
 }

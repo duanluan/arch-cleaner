@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -12,13 +12,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::cli::{parse_u8, parse_u16, print_plan, print_results, print_scan_reports};
 use crate::executor::{ExecutionMode, ExecutionOptions, execute_targets};
 use crate::i18n::{self, Language};
-use crate::model::{CleanerOptions, CleanupTarget};
-use crate::rules::{all_targets, is_valid_journal_size, scan_all};
+use crate::model::{CleanerOptions, CleanupTarget, ScanItem, ScanReport};
+use crate::platform::format_bytes;
+use crate::rules::{all_targets, is_valid_journal_size, item_removal_target, scan_all};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
     Targets,
     Settings,
+    Results,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +163,14 @@ pub fn run(language: Language) -> Result<i32, String> {
     session.run()
 }
 
+/// 扫描结果页的一行：指向某个报告里的某个条目。
+struct ItemRow {
+    target_id: String,
+    report_index: usize,
+    item_index: usize,
+    needs_sudo: bool,
+}
+
 struct Session {
     page: Page,
     language: Language,
@@ -169,6 +179,10 @@ struct Session {
     selected: Vec<bool>,
     target_cursor: usize,
     setting_cursor: usize,
+    reports: Vec<ScanReport>,
+    item_rows: Vec<ItemRow>,
+    item_selected: Vec<bool>,
+    results_cursor: usize,
 }
 
 impl Session {
@@ -185,6 +199,10 @@ impl Session {
             selected,
             target_cursor: 0,
             setting_cursor: 0,
+            reports: Vec::new(),
+            item_rows: Vec::new(),
+            item_selected: Vec::new(),
+            results_cursor: 0,
         }
     }
 
@@ -228,6 +246,7 @@ impl Session {
         match self.page {
             Page::Targets => self.handle_targets_key(code),
             Page::Settings => self.handle_settings_key(code),
+            Page::Results => self.handle_results_key(code),
         }
     }
 
@@ -281,6 +300,36 @@ impl Session {
         Ok(false)
     }
 
+    fn handle_results_key(&mut self, code: KeyCode) -> Result<bool, String> {
+        match code {
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Left | KeyCode::Char('g') => {
+                self.page = Page::Targets;
+            }
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.results_cursor = move_index(self.results_cursor, -1, self.item_rows.len());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.results_cursor = move_index(self.results_cursor, 1, self.item_rows.len());
+            }
+            KeyCode::Home => self.results_cursor = 0,
+            KeyCode::End => self.results_cursor = self.item_rows.len().saturating_sub(1),
+            KeyCode::Char('a') => self.item_selected.fill(true),
+            KeyCode::Char('n') => self.item_selected.fill(false),
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_item_selection(),
+            KeyCode::Char('c') => self.clean_selected_items()?,
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn toggle_item_selection(&mut self) {
+        if self.results_cursor < self.item_selected.len() {
+            self.item_selected[self.results_cursor] = !self.item_selected[self.results_cursor];
+        }
+    }
+
     fn draw(&self) -> Result<(), String> {
         let (width, height) =
             terminal::size().map_err(|error| format!("could not read terminal size: {error}"))?;
@@ -311,6 +360,7 @@ impl Session {
         match self.page {
             Page::Targets => self.draw_targets(&mut stdout, width, height)?,
             Page::Settings => self.draw_settings(&mut stdout, width, height)?,
+            Page::Results => self.draw_results(&mut stdout, width, height)?,
         }
         self.draw_footer(&mut stdout, width, height)?;
 
@@ -324,6 +374,7 @@ impl Session {
         let page_label = match self.page {
             Page::Targets => i18n::targets_page_title(self.language),
             Page::Settings => i18n::settings_page_title(self.language),
+            Page::Results => i18n::scan_header(self.language),
         };
         let header = format!(
             "arch-cleaner {}  |  {}  |  {} {}/{}  |  {}: {}",
@@ -562,6 +613,67 @@ impl Session {
         Ok(())
     }
 
+    fn draw_results(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<(), String> {
+        let content = content_rect(width, height);
+        if content.is_empty() {
+            return Ok(());
+        }
+
+        draw_panel_title(stdout, content, i18n::scan_header(self.language))?;
+        let body = content.inset(0, 1);
+        if body.is_empty() {
+            return Ok(());
+        }
+
+        if self.item_rows.is_empty() {
+            write_at(
+                stdout,
+                body.x,
+                body.y,
+                body.width,
+                i18n::no_targets_selected(self.language),
+                Paint::MUTED,
+            )?;
+            return Ok(());
+        }
+
+        let capacity = body.height as usize;
+        let start = scroll_start(self.results_cursor, self.item_rows.len(), capacity);
+        let end = (start + capacity).min(self.item_rows.len());
+
+        for (visible, index) in (start..end).enumerate() {
+            let row = &self.item_rows[index];
+            let item = &self.reports[row.report_index].items[row.item_index];
+            let focused = index == self.results_cursor;
+            let mark = if self.item_selected[index] { "x" } else { " " };
+            let line = format!(
+                "{} [{}] {:<15} {} ({})",
+                if focused { ">" } else { " " },
+                mark,
+                row.target_id,
+                item.path.display(),
+                format_bytes(item.bytes)
+            );
+            let paint = if focused {
+                Paint::FOCUS
+            } else if self.item_selected[index] {
+                Paint::NORMAL
+            } else {
+                Paint::MUTED
+            };
+            write_at(
+                stdout,
+                body.x,
+                body.y + visible as u16,
+                body.width,
+                line,
+                paint,
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn draw_settings(
         &self,
         stdout: &mut io::Stdout,
@@ -727,6 +839,7 @@ impl Session {
         let help = match self.page {
             Page::Targets => i18n::help_line(self.language),
             Page::Settings => i18n::settings_page_hint(self.language),
+            Page::Results => i18n::results_help_line(self.language),
         };
         write_at(stdout, 0, footer_top + 1, width, help, Paint::MUTED)?;
         write_at(
@@ -801,8 +914,46 @@ impl Session {
         let reports = scan_all(&selected_targets, &self.options, self.language);
 
         print_scan_reports(&reports, self.language);
+        self.open_results_page(reports);
 
         wait_for_enter_then_resume(i18n::scan_finished(self.language), self.language)
+    }
+
+    /// 扫描完成后进入结果页：把带逐项路径的报告铺成可勾选的行。
+    /// 默认全不勾选，清理哪些由用户逐项决定。
+    fn open_results_page(&mut self, reports: Vec<ScanReport>) {
+        let sudo_by_id: HashMap<&str, bool> = self
+            .targets
+            .iter()
+            .map(|target| (target.id, target.requires_sudo))
+            .collect();
+
+        let mut rows = Vec::new();
+        for (report_index, report) in reports.iter().enumerate() {
+            if report.items.is_empty() {
+                continue;
+            }
+            let needs_sudo = sudo_by_id
+                .get(report.target_id.as_str())
+                .copied()
+                .unwrap_or(false);
+            for item_index in 0..report.items.len() {
+                rows.push(ItemRow {
+                    target_id: report.target_id.clone(),
+                    report_index,
+                    item_index,
+                    needs_sudo,
+                });
+            }
+        }
+
+        self.item_selected = vec![false; rows.len()];
+        self.item_rows = rows;
+        self.results_cursor = 0;
+        self.reports = reports;
+        if !self.item_rows.is_empty() {
+            self.page = Page::Results;
+        }
     }
 
     fn apply_selected(&mut self) -> Result<(), String> {
@@ -829,6 +980,59 @@ impl Session {
 
         let results = execute_targets(
             &selected_targets,
+            ExecutionOptions {
+                mode: ExecutionMode::Apply,
+                run_readonly_checks: true,
+            },
+        );
+        print_results(&results, self.language);
+        wait_for_enter_then_resume(i18n::cleanup_finished(self.language), self.language)
+    }
+
+    fn clean_selected_items(&mut self) -> Result<(), String> {
+        let picked: Vec<(usize, usize, bool)> = self
+            .item_rows
+            .iter()
+            .zip(self.item_selected.iter())
+            .filter(|(_, selected)| **selected)
+            .map(|(row, _)| (row.report_index, row.item_index, row.needs_sudo))
+            .collect();
+
+        if picked.is_empty() {
+            return wait_for_enter_then_resume(
+                i18n::no_items_selected(self.language),
+                self.language,
+            );
+        }
+
+        let mut plain: Vec<ScanItem> = Vec::new();
+        let mut privileged: Vec<ScanItem> = Vec::new();
+        for (report_index, item_index, needs_sudo) in &picked {
+            let item = self.reports[*report_index].items[*item_index].clone();
+            if *needs_sudo {
+                privileged.push(item);
+            } else {
+                plain.push(item);
+            }
+        }
+
+        let mut targets = Vec::new();
+        if !plain.is_empty() {
+            targets.push(item_removal_target(&plain, false)?);
+        }
+        if !privileged.is_empty() {
+            targets.push(item_removal_target(&privileged, true)?);
+        }
+
+        show_output_screen()?;
+        print_plan(&targets, ExecutionMode::Apply, &self.options, self.language);
+
+        if !confirm_apply_cooked(self.language)? {
+            return wait_for_enter_then_resume(i18n::aborted(self.language), self.language);
+        }
+
+        let results = execute_targets(
+            &targets,
             ExecutionOptions {
                 mode: ExecutionMode::Apply,
                 run_readonly_checks: true,
@@ -952,6 +1156,15 @@ impl Session {
     }
 
     fn refresh_targets(&mut self) {
+        // 阈值变了，旧扫描结果不再可信：清空结果页数据并退回目标页。
+        self.reports.clear();
+        self.item_rows.clear();
+        self.item_selected.clear();
+        self.results_cursor = 0;
+        if self.page == Page::Results {
+            self.page = Page::Targets;
+        }
+
         let selected_ids: HashSet<&'static str> = self
             .targets
             .iter()
@@ -1333,6 +1546,53 @@ mod tests {
     fn bumps_journal_size_without_losing_suffix() {
         assert_eq!(bump_size_up("1G"), "2G");
         assert_eq!(bump_size_down("2G"), "1G");
+    }
+
+    #[test]
+    fn results_page_supports_item_toggles() {
+        use crate::model::{CleanerOptions, ScanItem};
+        use crate::rules::all_targets;
+        use std::path::PathBuf;
+
+        let mut session = Session::new(Language::ZhCn);
+        let target = all_targets(&CleanerOptions::default())
+            .into_iter()
+            .find(|target| target.id == "user-cache")
+            .unwrap();
+        let mut report = crate::model::ScanReport::new(&target);
+        for path in ["/home/demo/.cache/old-a", "/home/demo/.cache/old-b"] {
+            report.items.push(ScanItem {
+                path: PathBuf::from(path),
+                bytes: 1024,
+                entries: 2,
+            });
+        }
+
+        session.open_results_page(vec![report]);
+        assert_eq!(session.page, Page::Results);
+        assert_eq!(session.item_rows.len(), 2);
+
+        session
+            .handle_key(KeyCode::Down, KeyModifiers::empty())
+            .unwrap();
+        session
+            .handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+            .unwrap();
+        assert!(session.item_selected[1]);
+
+        session
+            .handle_key(KeyCode::Char('a'), KeyModifiers::empty())
+            .unwrap();
+        assert!(session.item_selected.iter().all(|selected| *selected));
+        session
+            .handle_key(KeyCode::Char('n'), KeyModifiers::empty())
+            .unwrap();
+        assert!(!session.item_selected.iter().any(|selected| *selected));
+
+        session
+            .handle_key(KeyCode::Tab, KeyModifiers::empty())
+            .unwrap();
+        assert_eq!(session.page, Page::Targets);
     }
 
     #[test]

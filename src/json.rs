@@ -2,7 +2,9 @@ use std::fmt::Write;
 
 use crate::executor::{CommandStatus, ExecutionMode, ExecutionResult, commands_for_target};
 use crate::i18n::Language;
-use crate::model::{CleanerOptions, CleanupCommand, CleanupTarget, ScanReport, ScanStatus};
+use crate::model::{
+    CleanerOptions, CleanupCommand, CleanupTarget, ScanItem, ScanReport, ScanStatus,
+};
 
 pub fn targets(targets: &[CleanupTarget], options: &CleanerOptions, language: Language) -> String {
     let mut json = String::new();
@@ -49,6 +51,8 @@ pub fn scan_reports(
         push_optional_u64(&mut json, report.estimated_bytes);
         json.push_str(",\"estimated_items\":");
         push_optional_usize(&mut json, report.estimated_items);
+        json.push_str(",\"items\":");
+        push_items(&mut json, &report.items);
         json.push_str(",\"details\":");
         push_string_array(&mut json, &report.details);
         json.push_str(",\"warnings\":");
@@ -282,6 +286,24 @@ fn push_string_field(json: &mut String, key: &str, value: &str) {
     push_string(json, value);
 }
 
+fn push_items(json: &mut String, items: &[ScanItem]) {
+    json.push('[');
+
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+
+        json.push('{');
+        push_string_field(json, "path", &item.path.to_string_lossy());
+        write!(json, ",\"bytes\":{}", item.bytes).expect("write to string cannot fail");
+        write!(json, ",\"entries\":{}", item.entries).expect("write to string cannot fail");
+        json.push('}');
+    }
+
+    json.push(']');
+}
+
 fn push_string_array(json: &mut String, values: &[String]) {
     json.push('[');
 
@@ -337,7 +359,7 @@ mod tests {
     use super::{clean_result, scan_reports, targets};
     use crate::executor::{CommandStatus, ExecutionMode, ExecutionResult};
     use crate::i18n::Language;
-    use crate::model::{CleanerOptions, ScanReport};
+    use crate::model::{CleanerOptions, ScanItem, ScanReport};
     use crate::rules::all_targets;
 
     #[test]
@@ -369,6 +391,24 @@ mod tests {
         assert!(json.contains("\"estimated_bytes\":null"));
         assert!(json.contains("\"estimated_items\":null"));
         assert!(json.contains("quote: \\\" newline:\\n"));
+    }
+
+    #[test]
+    fn serializes_scan_report_items() {
+        let options = CleanerOptions::default();
+        let targets = all_targets(&options);
+        let mut report = ScanReport::new(&targets[0]);
+        report.items.push(ScanItem {
+            path: std::path::PathBuf::from("/tmp/cache dir"),
+            bytes: 1024,
+            entries: 3,
+        });
+
+        let json = scan_reports(&[report], &options, Language::En);
+
+        assert!(
+            json.contains("\"items\":[{\"path\":\"/tmp/cache dir\",\"bytes\":1024,\"entries\":3}]")
+        );
     }
 
     #[test]

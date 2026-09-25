@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::i18n::Language;
 
@@ -149,6 +150,15 @@ impl fmt::Display for ScanStatus {
     }
 }
 
+/// 扫描发现的单个可清理条目（一个顶层目录或文件）。
+/// 文件选择器以它为数据源，clean 只删除用户勾选的条目。
+#[derive(Clone, Debug)]
+pub struct ScanItem {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub entries: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanReport {
     pub target_id: String,
@@ -158,6 +168,7 @@ pub struct ScanReport {
     pub status: ScanStatus,
     pub estimated_bytes: Option<u64>,
     pub estimated_items: Option<usize>,
+    pub items: Vec<ScanItem>,
     pub details: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -172,6 +183,7 @@ impl ScanReport {
             status: ScanStatus::Ready,
             estimated_bytes: None,
             estimated_items: None,
+            items: Vec::new(),
             details: Vec::new(),
             warnings: Vec::new(),
         }

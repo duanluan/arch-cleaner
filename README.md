@@ -49,7 +49,7 @@ Start the interactive menu in English:
 arch-cleaner -l en
 ```
 
-The TUI accepts Ctrl+L to switch between Chinese and English. Press Tab to open the settings page, where you can edit thresholds such as pacman package versions to keep, journal age/size, AI agent cache age, temp file age, and user cache age. Use arrow keys to move and Space to toggle targets.
+The TUI accepts Ctrl+L to switch between Chinese and English. Press Tab to open the settings page, where you can edit thresholds such as pacman package versions to keep, journal age/size, AI agent cache age, temp file age, and user cache age. Use arrow keys to move and Space to toggle targets. After scanning (`s`), targets that report per-item paths (user cache, temp files, AI agent caches) open a results page: use arrow keys to move, Space to toggle individual entries, `a`/`n` to select all/none, and `c` to clean only the selected entries — each removal is an explicit `rm -rf -- <path>` command shown for confirmation before anything runs.
 
 List supported targets:
 
