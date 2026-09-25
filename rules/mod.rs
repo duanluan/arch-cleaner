@@ -1359,7 +1359,7 @@ fn add_cleanable_entry_details(
     mut entries: Vec<CleanableEntry>,
     language: Language,
 ) {
-    entries.sort_by(|left, right| right.bytes.cmp(&left.bytes));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
     let total_bytes = entries
         .iter()
         .fold(0u64, |total, entry| total.saturating_add(entry.bytes));
