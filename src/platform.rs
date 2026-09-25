@@ -154,7 +154,9 @@ fn shell_quote(value: &OsStr) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn is_ignorable_io_error(error: &io::Error) -> bool {
+/// 扫描/遍历时可安全跳过的 IO 错误（目录消失、无权限等）；
+/// rules 与 platform 的遍历共用同一份判定。
+pub fn is_ignorable_io_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::NotFound

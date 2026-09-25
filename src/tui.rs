@@ -9,7 +9,7 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::cli::{print_plan, print_results, print_scan_reports};
+use crate::cli::{parse_u8, parse_u16, print_plan, print_results, print_scan_reports};
 use crate::executor::{ExecutionMode, ExecutionOptions, execute_targets};
 use crate::i18n::{self, Language};
 use crate::model::{CleanerOptions, CleanupTarget};
@@ -862,10 +862,12 @@ impl Session {
     fn update_setting(&mut self, field: SettingField, value: &str) -> Result<(), String> {
         match field {
             SettingField::KeepPackages => {
-                self.options.keep_package_versions = parse_u8_value(field, value, self.language)?;
+                self.options.keep_package_versions =
+                    parse_u8(field.label(self.language), value, self.language)?;
             }
             SettingField::JournalDays => {
-                self.options.journal_days = parse_u16_value(field, value, self.language)?;
+                self.options.journal_days =
+                    parse_u16(field.label(self.language), value, self.language)?;
             }
             SettingField::JournalSize => {
                 if !is_valid_journal_size(value) {
@@ -878,14 +880,16 @@ impl Session {
                 self.options.journal_size = value.trim().to_string();
             }
             SettingField::TempDays => {
-                self.options.temp_min_age_days = parse_u16_value(field, value, self.language)?;
+                self.options.temp_min_age_days =
+                    parse_u16(field.label(self.language), value, self.language)?;
             }
             SettingField::UserCacheDays => {
                 self.options.user_cache_min_age_days =
-                    parse_u16_value(field, value, self.language)?;
+                    parse_u16(field.label(self.language), value, self.language)?;
             }
             SettingField::AiAgentDays => {
-                self.options.ai_agent_min_age_days = parse_u16_value(field, value, self.language)?;
+                self.options.ai_agent_min_age_days =
+                    parse_u16(field.label(self.language), value, self.language)?;
             }
         }
 
@@ -1223,18 +1227,6 @@ fn show_message(message: &str, language: Language) -> Result<(), String> {
     println!("\r\n{message}");
     let _ = read_line_cooked(i18n::press_enter_prompt(language))?;
     resume_menu_screen()
-}
-
-fn parse_u8_value(field: SettingField, value: &str, language: Language) -> Result<u8, String> {
-    value
-        .parse::<u8>()
-        .map_err(|_| i18n::invalid_setting_value(language, field.label(language), value))
-}
-
-fn parse_u16_value(field: SettingField, value: &str, language: Language) -> Result<u16, String> {
-    value
-        .parse::<u16>()
-        .map_err(|_| i18n::invalid_setting_value(language, field.label(language), value))
 }
 
 fn bump_size_up(value: &str) -> String {

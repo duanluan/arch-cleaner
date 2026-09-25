@@ -1,6 +1,5 @@
 use crate::executor::ExecutionMode;
-use crate::model::{CleanerOptions, RiskLevel, ScanStatus, TargetGroup};
-use crate::rules::all_targets;
+use crate::model::{RiskLevel, ScanStatus, TargetGroup};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Language {
@@ -52,26 +51,6 @@ pub fn tr_owned(language: Language, zh: String, en: String) -> String {
     match language {
         Language::ZhCn => zh,
         Language::En => en,
-    }
-}
-
-fn target_id_list() -> String {
-    all_targets(&CleanerOptions::default())
-        .iter()
-        .map(|target| target.id)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-pub fn help_text(language: Language, version: &str) -> String {
-    let targets = target_id_list();
-    match language {
-        Language::ZhCn => format!(
-            "arch-cleaner {version}\n\n用法:\n    arch-cleaner                  启动交互式 TUI 菜单\n    arch-cleaner tui              启动交互式 TUI 菜单\n    arch-cleaner list-targets     显示清理目标\n    arch-cleaner scan [OPTIONS]   检查选中的目标\n    arch-cleaner clean [OPTIONS]  显示或执行清理计划\n\n选项:\n    -V, --version                 显示版本号\n    --lang, -l <zh|en>            界面语言 [默认: zh]\n    --targets <ids>               以逗号分隔的目标 ID，或 all\n    --apply                       执行清理命令\n    --yes, -y                     跳过 --apply 的确认提示\n    --run-readonly-checks         在 dry-run 模式下运行只读命令\n    --json                        输出机器可读 JSON\n    --keep-packages <n>           Pacman 包版本保留数量 [默认: 3]\n    --journal-days <n>            日志清理天数阈值 [默认: 14]\n    --journal-size <size>         日志清理大小阈值 [默认: 1G]\n    --temp-days <n>               临时文件保留天数 [默认: 7]\n    --user-cache-days <n>         用户缓存保留天数 [默认: 30]\n    --ai-agent-days <n>           AI agent 缓存保留天数 [默认: 30]\n\n说明:\n    在 TUI 中按 Tab 进入设置页，按 Ctrl+L 切换语言。\n\n目标:\n    {targets}"
-        ),
-        Language::En => format!(
-            "arch-cleaner {version}\n\nUSAGE:\n    arch-cleaner                  Start the interactive TUI menu\n    arch-cleaner tui              Start the interactive TUI menu\n    arch-cleaner list-targets     Show cleanup targets\n    arch-cleaner scan [OPTIONS]   Inspect selected targets\n    arch-cleaner clean [OPTIONS]  Show or execute a cleanup plan\n\nOPTIONS:\n    -V, --version                 Print version\n    --lang, -l <zh|en>            UI language [default: zh]\n    --targets <ids>               Comma-separated target ids, or all\n    --apply                       Execute cleanup commands\n    --yes, -y                     Skip confirmation prompts for --apply\n    --run-readonly-checks         In dry-run mode, run read-only commands\n    --json                        Print machine-readable JSON\n    --keep-packages <n>           Pacman package versions to keep [default: 3]\n    --journal-days <n>            Journal age vacuum threshold [default: 14]\n    --journal-size <size>         Journal size vacuum threshold [default: 1G]\n    --temp-days <n>               Temp file age threshold [default: 7]\n    --user-cache-days <n>         User cache age threshold [default: 30]\n    --ai-agent-days <n>           AI agent cache age threshold [default: 30]\n\nNOTES:\n    Press Tab in the TUI to open settings and Ctrl+L to switch languages.\n\nTARGETS:\n    {targets}"
-        ),
     }
 }
 
@@ -338,9 +317,7 @@ pub fn control_l_hint(language: Language) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Language, help_text, parse_language};
-    use crate::model::CleanerOptions;
-    use crate::rules::all_targets;
+    use super::{Language, parse_language};
 
     #[test]
     fn parses_language_codes() {
@@ -352,27 +329,5 @@ mod tests {
     fn toggles_language() {
         assert_eq!(Language::ZhCn.toggle(), Language::En);
         assert_eq!(Language::En.toggle(), Language::ZhCn);
-    }
-
-    #[test]
-    fn help_lists_every_registered_target() {
-        let ids = all_targets(&CleanerOptions::default())
-            .iter()
-            .map(|target| target.id)
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        assert!(help_text(Language::ZhCn, "0.1.0").contains(&ids));
-        assert!(help_text(Language::En, "0.1.0").contains(&ids));
-    }
-
-    #[test]
-    fn builds_localized_help_text() {
-        let help = help_text(Language::ZhCn, "0.1.0");
-        assert!(help.contains("Ctrl+L 切换语言"));
-        assert!(help.contains("-V, --version"));
-        let help = help_text(Language::En, "0.1.0");
-        assert!(help.contains("UI language"));
-        assert!(help.contains("-V, --version"));
     }
 }

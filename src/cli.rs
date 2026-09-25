@@ -611,13 +611,13 @@ fn require_value<'a>(
         .ok_or_else(|| i18n::missing_value(language, flag))
 }
 
-fn parse_u8(flag: &str, value: &str, language: Language) -> Result<u8, String> {
+pub(crate) fn parse_u8(flag: &str, value: &str, language: Language) -> Result<u8, String> {
     value
         .parse::<u8>()
         .map_err(|_| i18n::invalid_integer(language, flag, value))
 }
 
-fn parse_u16(flag: &str, value: &str, language: Language) -> Result<u16, String> {
+pub(crate) fn parse_u16(flag: &str, value: &str, language: Language) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|_| i18n::invalid_integer(language, flag, value))
@@ -645,8 +645,26 @@ fn confirm_apply(language: Language) -> Result<bool, String> {
     Ok(answer.trim() == "APPLY")
 }
 
+/// CLI 帮助文案放在 cli 而不是 i18n：目标清单从注册表生成，
+/// 帮助内容随命令行选项演进，i18n 不需要反向依赖 rules。
+fn help_text(language: Language, version: &str) -> String {
+    let targets = all_targets(&CleanerOptions::default())
+        .iter()
+        .map(|target| target.id)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match language {
+        Language::ZhCn => format!(
+            "arch-cleaner {version}\n\n用法:\n    arch-cleaner                  启动交互式 TUI 菜单\n    arch-cleaner tui              启动交互式 TUI 菜单\n    arch-cleaner list-targets     显示清理目标\n    arch-cleaner scan [OPTIONS]   检查选中的目标\n    arch-cleaner clean [OPTIONS]  显示或执行清理计划\n\n选项:\n    -V, --version                 显示版本号\n    --lang, -l <zh|en>            界面语言 [默认: zh]\n    --targets <ids>               以逗号分隔的目标 ID，或 all\n    --apply                       执行清理命令\n    --yes, -y                     跳过 --apply 的确认提示\n    --run-readonly-checks         在 dry-run 模式下运行只读命令\n    --json                        输出机器可读 JSON\n    --keep-packages <n>           Pacman 包版本保留数量 [默认: 3]\n    --journal-days <n>            日志清理天数阈值 [默认: 14]\n    --journal-size <size>         日志清理大小阈值 [默认: 1G]\n    --temp-days <n>               临时文件保留天数 [默认: 7]\n    --user-cache-days <n>         用户缓存保留天数 [默认: 30]\n    --ai-agent-days <n>           AI agent 缓存保留天数 [默认: 30]\n\n说明:\n    在 TUI 中按 Tab 进入设置页，按 Ctrl+L 切换语言。\n\n目标:\n    {targets}"
+        ),
+        Language::En => format!(
+            "arch-cleaner {version}\n\nUSAGE:\n    arch-cleaner                  Start the interactive TUI menu\n    arch-cleaner tui              Start the interactive TUI menu\n    arch-cleaner list-targets     Show cleanup targets\n    arch-cleaner scan [OPTIONS]   Inspect selected targets\n    arch-cleaner clean [OPTIONS]  Show or execute a cleanup plan\n\nOPTIONS:\n    -V, --version                 Print version\n    --lang, -l <zh|en>            UI language [default: zh]\n    --targets <ids>               Comma-separated target ids, or all\n    --apply                       Execute cleanup commands\n    --yes, -y                     Skip confirmation prompts for --apply\n    --run-readonly-checks         In dry-run mode, run read-only commands\n    --json                        Print machine-readable JSON\n    --keep-packages <n>           Pacman package versions to keep [default: 3]\n    --journal-days <n>            Journal age vacuum threshold [default: 14]\n    --journal-size <size>         Journal size vacuum threshold [default: 1G]\n    --temp-days <n>               Temp file age threshold [default: 7]\n    --user-cache-days <n>         User cache age threshold [default: 30]\n    --ai-agent-days <n>           AI agent cache age threshold [default: 30]\n\nNOTES:\n    Press Tab in the TUI to open settings and Ctrl+L to switch languages.\n\nTARGETS:\n    {targets}"
+        ),
+    }
+}
+
 fn print_help(language: Language) {
-    println!("{}", i18n::help_text(language, env!("CARGO_PKG_VERSION")));
+    println!("{}", help_text(language, env!("CARGO_PKG_VERSION")));
 }
 
 #[cfg(test)]
@@ -693,6 +711,20 @@ mod tests {
         let error = super::select_targets(&targets, Some("wat"), Language::En).unwrap_err();
 
         assert!(error.contains("unknown target"));
+    }
+
+    #[test]
+    fn help_lists_every_registered_target() {
+        let ids = all_targets(&CleanerOptions::default())
+            .iter()
+            .map(|target| target.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let help = super::help_text(Language::ZhCn, "0.1.0");
+        assert!(help.contains(&ids) && help.contains("-V, --version"));
+
+        let help = super::help_text(Language::En, "0.1.0");
+        assert!(help.contains(&ids) && help.contains("UI language"));
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::model::{
     ScanStatus, TargetGroup,
 };
 use crate::platform::{
-    command_exists, count_non_empty_lines, dir_size, format_bytes, home_dir, output_text,
-    parse_human_bytes, path_display, run_capture, run_capture_with_env,
+    command_exists, count_non_empty_lines, dir_size, format_bytes, home_dir, is_ignorable_io_error,
+    output_text, parse_human_bytes, path_display, run_capture, run_capture_with_env,
 };
 
 pub fn all_targets(options: &CleanerOptions) -> Vec<CleanupTarget> {
@@ -350,20 +350,16 @@ fn ai_agent_caches(options: &CleanerOptions) -> CleanupTarget {
             )
         },
         scan: scan_ai_agent_caches,
-        dry_run_commands: vec![CleanupCommand::shell(
-            format!(
-                "find whitelisted AI agent cache/log/temp-scratch entries -mtime {min_age} -print"
-            ),
-            ai_agent_find_script(&candidate_dirs, &min_age, false),
-            false,
-        )],
-        apply_commands: vec![CleanupCommand::shell(
-            format!(
-                "find whitelisted AI agent cache/log/temp-scratch entries -mtime {min_age} -delete"
-            ),
-            ai_agent_find_script(&candidate_dirs, &min_age, true),
-            false,
-        )],
+        // 展示用逐字脚本（与 sh -c 实际执行的完全一致）：这个目标没有
+        // 单行等价命令，审计以脚本原文为准，而不是描述性占位。
+        dry_run_commands: vec![{
+            let script = ai_agent_find_script(&candidate_dirs, &min_age, false);
+            CleanupCommand::shell(script.clone(), script, false)
+        }],
+        apply_commands: vec![{
+            let script = ai_agent_find_script(&candidate_dirs, &min_age, true);
+            CleanupCommand::shell(script.clone(), script, false)
+        }],
     }
 }
 
@@ -1325,7 +1321,7 @@ fn cleanable_files_size(path: &Path, min_age_days: u16) -> io::Result<CleanableE
     while let Some(current) = stack.pop() {
         let children = match fs::read_dir(&current) {
             Ok(children) => children,
-            Err(error) if is_ignorable_scan_error(&error) => continue,
+            Err(error) if is_ignorable_io_error(&error) => continue,
             Err(error) => return Err(error),
         };
 
@@ -1333,7 +1329,7 @@ fn cleanable_files_size(path: &Path, min_age_days: u16) -> io::Result<CleanableE
             let child_path = entry.path();
             let metadata = match fs::symlink_metadata(&child_path) {
                 Ok(metadata) => metadata,
-                Err(error) if is_ignorable_scan_error(&error) => continue,
+                Err(error) if is_ignorable_io_error(&error) => continue,
                 Err(error) => return Err(error),
             };
 
@@ -1428,16 +1424,6 @@ fn is_older_than(metadata: &fs::Metadata, days: u16) -> bool {
 /// apply, otherwise entries between N and N+1 days are counted but not removed.
 fn matches_find_mtime_plus(age: Duration, days: u16) -> bool {
     age.as_secs() / 86_400 > u64::from(days)
-}
-
-fn is_ignorable_scan_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::BrokenPipe
-    )
 }
 
 fn add_dir_size(report: &mut ScanReport, path: &Path, label: &str, language: Language) {
