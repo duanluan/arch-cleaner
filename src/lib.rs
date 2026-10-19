@@ -12,4 +12,4 @@ pub mod tui;
 pub mod rules;
 
 pub use model::{CleanerOptions, CleanupCommand, CleanupTarget, RiskLevel, ScanReport, ScanStatus};
-pub use rules::{all_targets, scan_all, scan_target};
+pub use rules::{all_targets, package_removal_target, scan_all, scan_target};

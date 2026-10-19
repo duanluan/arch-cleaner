@@ -20,13 +20,20 @@ Built-in cleanup rules live in [rules/README.md](rules/README.md). The engine in
 
 | Group | Target | ID | Scope | Default policy |
 | --- | --- | --- | --- | --- |
-| Packages | Pacman package cache | `pacman-cache` | `/var/cache/pacman/pkg` | `paccache -r -k 3`; scan uses `paccache -d -k 3` |
+| Packages | Pacman package cache | `pacman-cache` | `/var/cache/pacman/pkg` | `paccache -r -k 3` plus `paccache -ruk0` for caches of uninstalled packages; scan sums both dry-runs |
 | Packages | Orphan packages | `orphan-packages` | `pacman -Qtdq` | Remove with `pacman -Rns` after re-querying |
+| Packages | Large packages | `large-packages` | `pacman -Qi` | List the top 30 installed packages by size; picker-only; picked entries are uninstalled together via `pacman -Rns` (package names fed over stdin) |
+| Developer | Docker unused images | `docker-images` | docker images without containers | Official `docker image prune -a -f`; scan reads reclaimable bytes from `docker system df`; stopped containers and volumes untouched |
 | System | Systemd journal | `systemd-journal` | systemd journal files | Vacuum to 14 days and 1G |
-| User | User cache | `user-cache` | `$HOME/.cache` excluding thumbnails and known AI agent cache directories | Top-level directories older than 30 days |
+| User | User cache | `user-cache` | `$HOME/.cache` excluding thumbnails, JetBrains, and known AI agent cache directories | Top-level directories older than 30 days; caches of running apps (Edge/Chrome/Firefox/QQ) are skipped |
 | Developer | AI agent caches | `ai-agent-caches` | known agent cache/log/artifact paths plus whitelisted temp-scratch prefixes | Entries older than 30 days |
+| Developer | pnpm store | `pnpm-store` | pnpm content-addressable store | Official `pnpm store prune`; unreferenced packages only |
+| Developer | Conda package cache | `conda-cache` | conda `pkgs` cache (miniforge/miniconda/anaconda) | Official `conda clean --all -y` |
+| Developer | Gradle cache | `gradle-cache` | `$HOME/.gradle/caches` | Picker-only; no candidate while a Gradle process runs |
+| Developer | JetBrains stale version data | `jetbrains-stale` | `$HOME/.cache/JetBrains`, `$HOME/.local/share/JetBrains` | Directories whose version no longer matches an installed IDE; picker-only; settings directories untouched |
 | User | Temporary files | `temp-files` | `/var/tmp`, `/tmp` excluding known AI agent scratch prefixes and common runtime directories | Top-level entries older than 7 days |
 | User | Thumbnail cache | `thumbnail-cache` | `$HOME/.cache/thumbnails` | Clear generated thumbnails |
+| User | Trash | `trash` | `$HOME/.local/share/Trash` | Empty the trash |
 | System | System crash dumps | `crash-dumps` | `/var/lib/systemd/coredump` | Remove stored coredump files |
 | User | Old downloads | `old-downloads` | `$HOME/Downloads` | Remove old top-level entries (high risk; default 90 days) |
 | User | Large files | `large-files` | `$HOME` | List files over the size threshold (default 500M); picker-only |
@@ -52,7 +59,9 @@ Start the interactive menu in English:
 arch-cleaner -l en
 ```
 
-The TUI accepts Ctrl+L to switch between Chinese and English. Press Tab to open the settings page, where you can edit thresholds such as pacman package versions to keep, journal age/size, AI agent cache age, temp file age, and user cache age. Use arrow keys to move and Space to toggle targets. After scanning (`s`), targets that report per-item paths (user cache, temp files, AI agent caches) open a results page: use arrow keys to move, Space to toggle individual entries, `a`/`n` to select all/none, and `c` to clean only the selected entries — each removal is an explicit `rm -rf -- <path>` command shown for confirmation before anything runs.
+The TUI accepts Ctrl+L to switch between Chinese and English. Press Tab to open the settings page, where you can edit thresholds such as pacman package versions to keep, journal age/size, AI agent cache age, temp file age, and user cache age. Use arrow keys to move and Space to toggle targets.
+
+Scanning (`s`) runs on a background thread with a live progress line, so long scans (large files, duplicates) no longer freeze the interface; press Esc to stop after the current target finishes. When the scan completes, a grouped results page opens: each target is a section header showing its risk level, item count, total size, and how many entries are picked. Entries of low/medium-risk targets (caches) are picked by default, so the common flow is scan → review → `c`; high-risk groups (old downloads, large files, duplicates) start unpicked and are picked one by one or with `t`. Each cache entry carries a plain-language note (what this directory is and what happens after removal) shown on its row; the full path of the focused entry is shown in the detail line at the bottom. Move with arrows or `j`/`k`, page with PgUp/PgDn, toggle one entry with Space, a whole group with `t` (or Space on the header), and use `a`/`n` for all/none — `a` deliberately skips high-risk groups. The footer always shows the picked count and total size. Press `c` to clean only the picked entries — each removal is an explicit `rm -rf -- <path>` command shown for confirmation before anything runs.
 
 List supported targets:
 
@@ -167,7 +176,9 @@ This runs `cargo install --path . --locked --force --root "$HOME/.local"` from t
 
 The `ai-agent-caches` target is deliberately whitelist-based. It covers old cache, log, attachment, generated artifact, and temp-scratch entries for tools such as Codex, Claude, Cursor, Windsurf, Gemini, OpenCode, Pi, and rtk command logs. That includes selected `/var/tmp` and `/tmp` paths whose names match known agent prefixes. The generic `temp-files` target excludes those prefixes, common runtime directories such as AppImage mount points, and only handles top-level old entries, so the two rules do not overlap. It does not remove configuration files, secrets, session history, plugin installs, skills, Electron `Local Storage`/`IndexedDB`, or VS Code-style workspace state.
 
-System targets use `sudo` only when executing the apply plan. The interactive menu still prints the plan and requires typing `APPLY` before it runs cleanup commands.
+System targets use `sudo` only when executing the apply plan. The interactive menu still prints the plan (with a summary of what will be removed) and requires typing `y` to confirm before it runs cleanup commands.
+
+Caches of running applications are protected in two places. The `user-cache` rule skips the cache directories of running browsers and QQ both in the scan estimate and in the apply script (a `pgrep` guard re-checks at execution time); the `jetbrains-stale` and `gradle-cache` rules never offer entries while the corresponding IDE or a Gradle process is running. Developer tool stores are cleaned only through their official commands (`pnpm store prune`, `conda clean --all`), never by removing the store directories directly.
 
 ## Development
 

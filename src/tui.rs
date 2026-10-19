@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -9,17 +13,18 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::cli::{parse_u8, parse_u16, print_plan, print_results, print_scan_reports};
+use crate::cli::{parse_u8, parse_u16, print_plan, print_results};
 use crate::executor::{ExecutionMode, ExecutionOptions, execute_targets};
 use crate::i18n::{self, Language};
-use crate::model::{CleanerOptions, CleanupTarget, RiskLevel, ScanItem, ScanReport};
+use crate::model::{CleanerOptions, CleanupTarget, ItemKind, RiskLevel, ScanItem, ScanReport};
 use crate::platform::format_bytes;
-use crate::rules::{all_targets, is_valid_size_value, item_removal_target, scan_all};
+use crate::rules::{all_targets, is_valid_size_value, item_removal_target, scan_target};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
     Targets,
     Settings,
+    Scanning,
     Results,
 }
 
@@ -192,13 +197,47 @@ pub fn run(language: Language) -> Result<i32, String> {
     session.run()
 }
 
-/// 扫描结果页的一行：指向某个报告里的某个条目。
-struct ItemRow {
-    target_id: String,
-    report_index: usize,
-    item_index: usize,
-    needs_sudo: bool,
+/// 扫描结果页的一行：目标分组头，或指向某个报告里的某个条目。
+#[derive(Clone, Debug)]
+enum ResultsRow {
+    Group {
+        report_index: usize,
+        risk: RiskLevel,
+    },
+    Item {
+        report_index: usize,
+        item_index: usize,
+        needs_sudo: bool,
+        risk: RiskLevel,
+    },
 }
+
+impl ResultsRow {
+    fn report_index(&self) -> usize {
+        match self {
+            Self::Group { report_index, .. } | Self::Item { report_index, .. } => *report_index,
+        }
+    }
+}
+
+/// 后台扫描线程与主线程共享的状态。
+struct ScanProgress {
+    done: usize,
+    total: usize,
+    current: String,
+}
+
+struct ScanJob {
+    reports: Arc<Mutex<Vec<ScanReport>>>,
+    progress: Arc<Mutex<ScanProgress>>,
+    cancel: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// 翻页键一次移动的行数；结果显示容量在绘制时另行记录，
+/// 取两者中较小的一个。
+const PAGE_JUMP_ROWS: isize = 20;
 
 struct Session {
     page: Page,
@@ -209,9 +248,12 @@ struct Session {
     target_cursor: usize,
     setting_cursor: usize,
     reports: Vec<ScanReport>,
-    item_rows: Vec<ItemRow>,
+    rows: Vec<ResultsRow>,
     item_selected: Vec<bool>,
     results_cursor: usize,
+    last_results_capacity: usize,
+    scan_job: Option<ScanJob>,
+    scan_tick: u32,
 }
 
 impl Session {
@@ -233,9 +275,12 @@ impl Session {
             target_cursor: 0,
             setting_cursor: 0,
             reports: Vec::new(),
-            item_rows: Vec::new(),
+            rows: Vec::new(),
             item_selected: Vec::new(),
             results_cursor: 0,
+            last_results_capacity: 1,
+            scan_job: None,
+            scan_tick: 0,
         }
     }
 
@@ -244,6 +289,27 @@ impl Session {
 
         loop {
             self.draw()?;
+
+            if self.scan_job.is_some() {
+                // 扫描期间按固定间隔轮询事件：界面保持刷新（进度、
+                // 转动指示），Esc 请求取消，不阻塞在 event::read 上。
+                if event::poll(SCAN_POLL_INTERVAL)
+                    .map_err(|error| format!("could not poll key event: {error}"))?
+                {
+                    let event = event::read()
+                        .map_err(|error| format!("could not read key event: {error}"))?;
+                    if let Event::Key(key_event) = event
+                        && key_event.kind == KeyEventKind::Press
+                        && self.handle_key(key_event.code, key_event.modifiers)?
+                    {
+                        break;
+                    }
+                } else {
+                    self.scan_tick = self.scan_tick.wrapping_add(1);
+                }
+                self.poll_scan_completion();
+                continue;
+            }
 
             let event =
                 event::read().map_err(|error| format!("could not read key event: {error}"))?;
@@ -279,7 +345,23 @@ impl Session {
         match self.page {
             Page::Targets => self.handle_targets_key(code),
             Page::Settings => self.handle_settings_key(code),
+            Page::Scanning => self.handle_scanning_key(code),
             Page::Results => self.handle_results_key(code),
+        }
+    }
+
+    fn handle_scanning_key(&mut self, code: KeyCode) -> Result<bool, String> {
+        match code {
+            // 只提供取消，不做别的操作：避免扫描线程和界面状态交错修改。
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => self.request_scan_cancel(),
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn request_scan_cancel(&mut self) {
+        if let Some(job) = &self.scan_job {
+            job.cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -292,9 +374,11 @@ impl Session {
             KeyCode::Char(' ') => self.toggle_target_selection(),
             KeyCode::Up | KeyCode::Char('k') => self.move_target_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_target_cursor(1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.move_target_cursor(-10),
+            KeyCode::PageDown | KeyCode::Char('f') => self.move_target_cursor(10),
             KeyCode::Home => self.target_cursor = 0,
             KeyCode::End => self.target_cursor = self.targets.len().saturating_sub(1),
-            KeyCode::Char('s') | KeyCode::Enter => self.scan_selected()?,
+            KeyCode::Char('s') | KeyCode::Enter => self.start_scan()?,
             KeyCode::Char('c') => self.apply_selected()?,
             KeyCode::Char(character) if character.is_ascii_digit() => {
                 if let Some(index) = character
@@ -340,16 +424,25 @@ impl Session {
             }
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.results_cursor = move_index(self.results_cursor, -1, self.item_rows.len());
+                self.results_cursor = move_index(self.results_cursor, -1, self.rows.len());
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.results_cursor = move_index(self.results_cursor, 1, self.item_rows.len());
+                self.results_cursor = move_index(self.results_cursor, 1, self.rows.len());
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                let page = self.page_jump_rows();
+                self.results_cursor = move_index(self.results_cursor, -page, self.rows.len());
+            }
+            KeyCode::PageDown | KeyCode::Char('f') => {
+                let page = self.page_jump_rows();
+                self.results_cursor = move_index(self.results_cursor, page, self.rows.len());
             }
             KeyCode::Home => self.results_cursor = 0,
-            KeyCode::End => self.results_cursor = self.item_rows.len().saturating_sub(1),
-            KeyCode::Char('a') => self.item_selected.fill(true),
+            KeyCode::End => self.results_cursor = self.rows.len().saturating_sub(1),
+            KeyCode::Char('a') => self.select_all_safe(),
             KeyCode::Char('n') => self.item_selected.fill(false),
-            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_item_selection(),
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_row_selection(),
+            KeyCode::Char('t') => self.toggle_current_group(),
             KeyCode::Char('c') => self.clean_selected_items()?,
             _ => {}
         }
@@ -357,13 +450,64 @@ impl Session {
         Ok(false)
     }
 
-    fn toggle_item_selection(&mut self) {
-        if self.results_cursor < self.item_selected.len() {
-            self.item_selected[self.results_cursor] = !self.item_selected[self.results_cursor];
+    /// 翻页步长：用上一次绘制记录的可见行数，至少 1。
+    fn page_jump_rows(&self) -> isize {
+        let capacity = self.last_results_capacity.max(1) as isize;
+        capacity.min(PAGE_JUMP_ROWS)
+    }
+
+    /// 全选只作用于低/中风险目标的条目：高风险目标（下载旧文件、
+    /// 大文件、重复文件）涉及用户自己的文件，必须逐项勾选。
+    fn select_all_safe(&mut self) {
+        for (index, row) in self.rows.iter().enumerate() {
+            if let ResultsRow::Item { risk, .. } = row
+                && !matches!(risk, RiskLevel::High)
+            {
+                self.item_selected[index] = true;
+            }
         }
     }
 
-    fn draw(&self) -> Result<(), String> {
+    fn toggle_row_selection(&mut self) {
+        match self.rows.get(self.results_cursor) {
+            Some(ResultsRow::Item { .. }) => {
+                if self.results_cursor < self.item_selected.len() {
+                    self.item_selected[self.results_cursor] =
+                        !self.item_selected[self.results_cursor];
+                }
+            }
+            Some(ResultsRow::Group { .. }) => self.toggle_current_group(),
+            None => {}
+        }
+    }
+
+    /// 勾选/取消当前行所在目标的整组条目：组内已全选则全不选，否则全选。
+    fn toggle_current_group(&mut self) {
+        let Some(report_index) = self
+            .rows
+            .get(self.results_cursor)
+            .map(ResultsRow::report_index)
+        else {
+            return;
+        };
+        let positions: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(row, ResultsRow::Item { .. }) && row.report_index() == report_index
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let all_selected = positions
+            .iter()
+            .all(|index| self.item_selected.get(*index).copied().unwrap_or(false));
+        for index in positions {
+            self.item_selected[index] = !all_selected;
+        }
+    }
+
+    fn draw(&mut self) -> Result<(), String> {
         let (width, height) =
             terminal::size().map_err(|error| format!("could not read terminal size: {error}"))?;
         let mut stdout = io::stdout();
@@ -393,6 +537,7 @@ impl Session {
         match self.page {
             Page::Targets => self.draw_targets(&mut stdout, width, height)?,
             Page::Settings => self.draw_settings(&mut stdout, width, height)?,
+            Page::Scanning => self.draw_scanning(&mut stdout, width, height)?,
             Page::Results => self.draw_results(&mut stdout, width, height)?,
         }
         self.draw_footer(&mut stdout, width, height)?;
@@ -407,6 +552,7 @@ impl Session {
         let page_label = match self.page {
             Page::Targets => i18n::targets_page_title(self.language),
             Page::Settings => i18n::settings_page_title(self.language),
+            Page::Scanning => i18n::scanning_page_title(self.language),
             Page::Results => i18n::scan_header(self.language),
         };
         let header = format!(
@@ -646,7 +792,70 @@ impl Session {
         Ok(())
     }
 
-    fn draw_results(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<(), String> {
+    fn draw_scanning(
+        &self,
+        stdout: &mut io::Stdout,
+        width: u16,
+        height: u16,
+    ) -> Result<(), String> {
+        let content = content_rect(width, height);
+        if content.is_empty() {
+            return Ok(());
+        }
+
+        let progress = self
+            .scan_job
+            .as_ref()
+            .and_then(|job| job.progress.lock().ok())
+            .map(|progress| (progress.done, progress.total, progress.current.clone()))
+            .unwrap_or((0, 0, String::new()));
+        let (done, total, current) = progress;
+        let cancel_requested = self
+            .scan_job
+            .as_ref()
+            .is_some_and(|job| job.cancel.load(Ordering::Relaxed));
+
+        let frames = ['|', '/', '-', '\\'];
+        let spinner = frames[((self.scan_tick / 3) % frames.len() as u32) as usize];
+
+        let mut row = 0u16;
+        panel_line(
+            stdout,
+            content,
+            &mut row,
+            format!(
+                "{spinner} {} {}/{}",
+                i18n::tr(self.language, "扫描中", "Scanning"),
+                done,
+                total
+            ),
+            Paint::ACCENT,
+        )?;
+        panel_line(stdout, content, &mut row, &current, Paint::NORMAL)?;
+        panel_line(stdout, content, &mut row, "", Paint::NORMAL)?;
+
+        let status = if cancel_requested {
+            i18n::tr(
+                self.language,
+                "正在取消：等当前目标扫描结束……",
+                "Cancelling: waiting for the current target to finish...",
+            )
+        } else {
+            i18n::tr(
+                self.language,
+                "按 Esc 取消（当前目标扫描结束后停止）",
+                "Press Esc to cancel (stops after the current target finishes)",
+            )
+        };
+        panel_line(stdout, content, &mut row, status, Paint::MUTED)
+    }
+
+    fn draw_results(
+        &mut self,
+        stdout: &mut io::Stdout,
+        width: u16,
+        height: u16,
+    ) -> Result<(), String> {
         let content = content_rect(width, height);
         if content.is_empty() {
             return Ok(());
@@ -658,7 +867,7 @@ impl Session {
             return Ok(());
         }
 
-        if self.item_rows.is_empty() {
+        if self.rows.is_empty() {
             write_at(
                 stdout,
                 body.x,
@@ -670,37 +879,118 @@ impl Session {
             return Ok(());
         }
 
-        let capacity = body.height as usize;
-        let start = scroll_start(self.results_cursor, self.item_rows.len(), capacity);
-        let end = (start + capacity).min(self.item_rows.len());
+        // 预留最后一行显示当前条目的完整路径，列表行只放目录名和说明。
+        let detail_y = body.y + body.height.saturating_sub(1);
+        let capacity = (body.height as usize).saturating_sub(1);
+        self.last_results_capacity = capacity;
+        let start = scroll_start(self.results_cursor, self.rows.len(), capacity);
+        let end = (start + capacity).min(self.rows.len());
 
         for (visible, index) in (start..end).enumerate() {
-            let row = &self.item_rows[index];
-            let item = &self.reports[row.report_index].items[row.item_index];
+            let y = body.y + visible as u16;
             let focused = index == self.results_cursor;
-            let mark = if self.item_selected[index] { "x" } else { " " };
-            let line = format!(
-                "{} [{}] {:<15} {} ({})",
-                if focused { ">" } else { " " },
-                mark,
-                row.target_id,
-                item.path.display(),
-                format_bytes(item.bytes)
-            );
-            let paint = if focused {
-                Paint::FOCUS
-            } else if self.item_selected[index] {
-                Paint::NORMAL
-            } else {
-                Paint::MUTED
-            };
+            match &self.rows[index] {
+                ResultsRow::Group {
+                    report_index, risk, ..
+                } => {
+                    let report = &self.reports[*report_index];
+                    let selected_in_group = self
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| {
+                            matches!(row, ResultsRow::Item { .. })
+                                && row.report_index() == *report_index
+                        })
+                        .filter(|(row_index, _)| {
+                            self.item_selected.get(*row_index).copied().unwrap_or(false)
+                        })
+                        .count();
+                    let line = format!(
+                        "{} {} ▶ {} · {} {} · {} · {} {}/{}",
+                        if focused { ">" } else { " " },
+                        i18n::risk_label(self.language, *risk),
+                        report.title.get(self.language),
+                        report.items.len(),
+                        i18n::tr(self.language, "项", "items"),
+                        format_bytes(group_bytes(report)),
+                        i18n::tr(self.language, "已勾", "picked"),
+                        selected_in_group,
+                        report.items.len(),
+                    );
+                    // 高风险目标整组标黄，提示这一组是用户自己的文件。
+                    let paint = if focused {
+                        Paint::FOCUS
+                    } else if matches!(risk, RiskLevel::High) {
+                        Paint::WARNING
+                    } else {
+                        Paint::ACCENT
+                    };
+                    write_at(stdout, body.x, y, body.width, line, paint)?;
+                }
+                ResultsRow::Item {
+                    report_index,
+                    item_index,
+                    ..
+                } => {
+                    let item = &self.reports[*report_index].items[*item_index];
+                    let mark = if self.item_selected.get(index).copied().unwrap_or(false) {
+                        "x"
+                    } else {
+                        " "
+                    };
+                    // 目录名 + 一句说明 + 体积：目录名本身对使用者没有
+                    // 信息量，说明才是判断依据；完整路径在底部详情行。
+                    let name = item
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| item.path.display().to_string());
+                    let note = item
+                        .note
+                        .as_ref()
+                        .map(|note| format!(" — {}", note.get(self.language)))
+                        .unwrap_or_default();
+                    let line = format!(
+                        "{}   [{}] {}{} ({})",
+                        if focused { ">" } else { " " },
+                        mark,
+                        name,
+                        note,
+                        format_bytes(item.bytes)
+                    );
+                    let paint = if focused {
+                        Paint::FOCUS
+                    } else if self.item_selected.get(index).copied().unwrap_or(false) {
+                        Paint::NORMAL
+                    } else {
+                        Paint::MUTED
+                    };
+                    write_at(stdout, body.x, y, body.width, line, paint)?;
+                }
+            }
+        }
+
+        // 详情行：光标所在条目的完整路径（和说明），补齐列表行省略的信息。
+        if let Some(ResultsRow::Item {
+            report_index,
+            item_index,
+            ..
+        }) = self.rows.get(self.results_cursor)
+        {
+            let item = &self.reports[*report_index].items[*item_index];
+            let note = item
+                .note
+                .as_ref()
+                .map(|note| format!(" — {}", note.get(self.language)))
+                .unwrap_or_default();
             write_at(
                 stdout,
                 body.x,
-                body.y + visible as u16,
+                detail_y,
                 body.width,
-                line,
-                paint,
+                format!("{}{}", item.path.display(), note),
+                Paint::MUTED,
             )?;
         }
 
@@ -872,21 +1162,50 @@ impl Session {
         let help = match self.page {
             Page::Targets => i18n::help_line(self.language),
             Page::Settings => i18n::settings_page_hint(self.language),
+            Page::Scanning => "",
             Page::Results => i18n::results_help_line(self.language),
         };
         write_at(stdout, 0, footer_top + 1, width, help, Paint::MUTED)?;
-        write_at(
-            stdout,
-            0,
-            footer_top + 2,
-            width,
-            i18n::tr(
+        let tail = match self.page {
+            // 结果页第二行常驻勾选统计：按 c 之前能看到勾了多少、共多大。
+            Page::Results => {
+                let (count, bytes) = self.selected_summary();
+                format!(
+                    "{} {} · {}",
+                    i18n::tr(self.language, "已勾选", "Selected"),
+                    count,
+                    format_bytes(bytes)
+                )
+            }
+            Page::Scanning => String::new(),
+            _ => i18n::tr(
                 self.language,
                 "Ctrl+L 切换语言 | q 退出",
                 "Ctrl+L language | q quit",
-            ),
-            Paint::MUTED,
-        )
+            )
+            .to_string(),
+        };
+        write_at(stdout, 0, footer_top + 2, width, tail, Paint::MUTED)
+    }
+
+    /// 当前勾选条目数与体积合计，供结果页页脚显示。
+    fn selected_summary(&self) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for (index, row) in self.rows.iter().enumerate() {
+            if let ResultsRow::Item {
+                report_index,
+                item_index,
+                ..
+            } = row
+                && self.item_selected.get(index).copied().unwrap_or(false)
+            {
+                count += 1;
+                let item_bytes = self.reports[*report_index].items[*item_index].bytes;
+                bytes = bytes.saturating_add(item_bytes);
+            }
+        }
+        (count, bytes)
     }
 
     fn target_meta_line(&self, target: &CleanupTarget) -> String {
@@ -932,33 +1251,87 @@ impl Session {
         self.setting_cursor = move_index(self.setting_cursor, delta, SettingField::ALL.len());
     }
 
-    fn scan_selected(&mut self) -> Result<(), String> {
+    /// 在后台线程逐个扫描选中的目标：扫描期间界面持续刷新进度，
+    /// 不再整屏卡住；Esc 在当前目标结束后停止剩余目标。
+    fn start_scan(&mut self) -> Result<(), String> {
         let selected_targets = self.selected_targets();
-        show_output_screen()?;
-
         if selected_targets.is_empty() {
-            return wait_for_enter_then_resume(
-                i18n::no_targets_selected(self.language),
-                self.language,
-            );
+            return show_output_screen().and_then(|()| {
+                wait_for_enter_then_resume(i18n::no_targets_selected(self.language), self.language)
+            });
         }
 
-        println!("{}\n", i18n::scan_header(self.language));
-        let reports = scan_all(&selected_targets, &self.options, self.language);
+        let total = selected_targets.len();
+        let reports = Arc::new(Mutex::new(Vec::<ScanReport>::new()));
+        let progress = Arc::new(Mutex::new(ScanProgress {
+            done: 0,
+            total,
+            current: selected_targets[0].title.get(self.language).to_string(),
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
 
-        print_scan_reports(&reports, self.language);
-        self.open_results_page(reports);
+        let report_sink = Arc::clone(&reports);
+        let progress_sink = Arc::clone(&progress);
+        let cancel_flag = Arc::clone(&cancel);
+        let language = self.language;
+        let options = self.options.clone();
+        let handle = std::thread::spawn(move || {
+            for (index, target) in selected_targets.iter().enumerate() {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(mut progress) = progress_sink.lock() {
+                    progress.done = index;
+                    progress.current = target.title.get(language).to_string();
+                }
+                let report = scan_target(target, &options, language);
+                if let Ok(mut sink) = report_sink.lock() {
+                    sink.push(report);
+                }
+            }
+            if let Ok(mut progress) = progress_sink.lock() {
+                progress.done = progress.total;
+            }
+        });
 
-        wait_for_enter_then_resume(i18n::scan_finished(self.language), self.language)
+        self.scan_job = Some(ScanJob {
+            reports,
+            progress,
+            cancel,
+            handle,
+        });
+        self.scan_tick = 0;
+        self.page = Page::Scanning;
+        Ok(())
     }
 
-    /// 扫描完成后进入结果页：把带逐项路径的报告铺成可勾选的行。
-    /// 默认全不勾选，清理哪些由用户逐项决定。
+    /// 扫描线程结束后收尾：取回报告并进入结果页；取消且没有产出时
+    /// 退回目标页。
+    fn poll_scan_completion(&mut self) {
+        let Some(job) = &self.scan_job else {
+            return;
+        };
+        if !job.handle.is_finished() {
+            return;
+        }
+
+        let job = self.scan_job.take().expect("scan job checked above");
+        let reports = job
+            .reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default();
+        let _ = job.handle.join();
+        self.open_results_page(reports);
+    }
+
+    /// 扫描完成后进入结果页：每个带条目的报告铺成“分组头 + 条目行”。
+    /// 勾选默认值按风险决定（见函数尾部）。
     fn open_results_page(&mut self, reports: Vec<ScanReport>) {
-        let sudo_by_id: HashMap<&str, bool> = self
+        let meta_by_id: HashMap<&str, (bool, RiskLevel)> = self
             .targets
             .iter()
-            .map(|target| (target.id, target.requires_sudo))
+            .map(|target| (target.id, (target.requires_sudo, target.risk)))
             .collect();
 
         let mut rows = Vec::new();
@@ -966,26 +1339,37 @@ impl Session {
             if report.items.is_empty() {
                 continue;
             }
-            let needs_sudo = sudo_by_id
+            let (needs_sudo, risk) = meta_by_id
                 .get(report.target_id.as_str())
                 .copied()
-                .unwrap_or(false);
+                .unwrap_or((false, RiskLevel::Medium));
+            rows.push(ResultsRow::Group { report_index, risk });
             for item_index in 0..report.items.len() {
-                rows.push(ItemRow {
-                    target_id: report.target_id.clone(),
+                rows.push(ResultsRow::Item {
                     report_index,
                     item_index,
                     needs_sudo,
+                    risk,
                 });
             }
         }
 
-        self.item_selected = vec![false; rows.len()];
-        self.item_rows = rows;
+        // 与目标页的默认选择同一条规则：低/中风险（缓存类）默认勾上，
+        // 常见情况下用户确认即可；高风险（用户自己的文件）默认不勾。
+        self.item_selected = rows
+            .iter()
+            .map(|row| match row {
+                ResultsRow::Item { risk, .. } => !matches!(risk, RiskLevel::High),
+                ResultsRow::Group { .. } => false,
+            })
+            .collect();
+        self.rows = rows;
         self.results_cursor = 0;
         self.reports = reports;
-        if !self.item_rows.is_empty() {
+        if !self.rows.is_empty() {
             self.page = Page::Results;
+        } else {
+            self.page = Page::Targets;
         }
     }
 
@@ -1019,6 +1403,12 @@ impl Session {
             println!("{}\n", i18n::picker_only_hint(self.language, &ids));
         }
 
+        // 选中的全是逐项清理目标：没有可整批执行的命令，不再弹
+        // 空确认，提示后直接回菜单。
+        if bulk_targets.is_empty() {
+            return wait_for_enter_then_resume("", self.language);
+        }
+
         print_plan(
             &bulk_targets,
             ExecutionMode::Apply,
@@ -1026,28 +1416,50 @@ impl Session {
             self.language,
         );
 
-        if !confirm_apply_cooked(self.language)? {
+        if !confirm_apply_cooked(self.language, &plan_summary(&bulk_targets, self.language))? {
             return wait_for_enter_then_resume(i18n::aborted(self.language), self.language);
         }
 
         let results = execute_targets(
-            &selected_targets,
+            &bulk_targets,
             ExecutionOptions {
                 mode: ExecutionMode::Apply,
                 run_readonly_checks: true,
             },
         );
         print_results(&results, self.language);
-        wait_for_enter_then_resume(i18n::cleanup_finished(self.language), self.language)
+        wait_for_enter_then_resume(i18n::cleanup_finished(self.language), self.language)?;
+        // 清理已经执行，旧扫描结果不再可信：回目标页，下次扫描重建。
+        self.discard_results();
+        Ok(())
+    }
+
+    /// 清理执行后调用：丢弃过期的扫描结果，回到目标页。
+    fn discard_results(&mut self) {
+        self.reports.clear();
+        self.rows.clear();
+        self.item_selected.clear();
+        self.results_cursor = 0;
+        if self.page == Page::Results {
+            self.page = Page::Targets;
+        }
     }
 
     fn clean_selected_items(&mut self) -> Result<(), String> {
         let picked: Vec<(usize, usize, bool)> = self
-            .item_rows
+            .rows
             .iter()
-            .zip(self.item_selected.iter())
-            .filter(|(_, selected)| **selected)
-            .map(|(row, _)| (row.report_index, row.item_index, row.needs_sudo))
+            .enumerate()
+            .filter(|(index, _)| self.item_selected.get(*index).copied().unwrap_or(false))
+            .filter_map(|(_, row)| match row {
+                ResultsRow::Item {
+                    report_index,
+                    item_index,
+                    needs_sudo,
+                    ..
+                } => Some((*report_index, *item_index, *needs_sudo)),
+                ResultsRow::Group { .. } => None,
+            })
             .collect();
 
         if picked.is_empty() {
@@ -1059,12 +1471,13 @@ impl Session {
 
         let mut plain: Vec<ScanItem> = Vec::new();
         let mut privileged: Vec<ScanItem> = Vec::new();
+        let mut packages: Vec<ScanItem> = Vec::new();
         for (report_index, item_index, needs_sudo) in &picked {
             let item = self.reports[*report_index].items[*item_index].clone();
-            if *needs_sudo {
-                privileged.push(item);
-            } else {
-                plain.push(item);
+            match item.kind {
+                ItemKind::Package => packages.push(item),
+                ItemKind::Path if *needs_sudo => privileged.push(item),
+                ItemKind::Path => plain.push(item),
             }
         }
 
@@ -1075,11 +1488,46 @@ impl Session {
         if !privileged.is_empty() {
             targets.push(item_removal_target(&privileged, true)?);
         }
+        if !packages.is_empty() {
+            targets.push(crate::rules::package_removal_target(&packages)?);
+        }
+
+        // 确认前把“删多少、共多大、几项要 sudo / 几个包”再说一遍，
+        // 用户不用回头翻列表。软件包也计入条目数（体积是安装占用）。
+        let picked_count = plain.len() + privileged.len() + packages.len();
+        let picked_bytes = plain
+            .iter()
+            .chain(privileged.iter())
+            .chain(packages.iter())
+            .fold(0u64, |total, item| total.saturating_add(item.bytes));
+        let mut notes = String::new();
+        if !privileged.is_empty() {
+            notes.push_str(&format!(
+                " · {} {} sudo",
+                privileged.len(),
+                i18n::tr(self.language, "项需要", "entries need")
+            ));
+        }
+        if !packages.is_empty() {
+            notes.push_str(&format!(
+                " · {} {}",
+                packages.len(),
+                i18n::tr(self.language, "个软件包", "packages")
+            ));
+        }
+        let sudo_note = notes;
+        let summary = format!(
+            "{}: {} {} · {}{sudo_note}",
+            i18n::tr(self.language, "将删除", "Will remove"),
+            picked_count,
+            i18n::tr(self.language, "项", "items"),
+            format_bytes(picked_bytes)
+        );
 
         show_output_screen()?;
         print_plan(&targets, ExecutionMode::Apply, &self.options, self.language);
 
-        if !confirm_apply_cooked(self.language)? {
+        if !confirm_apply_cooked(self.language, &summary)? {
             return wait_for_enter_then_resume(i18n::aborted(self.language), self.language);
         }
 
@@ -1091,7 +1539,10 @@ impl Session {
             },
         );
         print_results(&results, self.language);
-        wait_for_enter_then_resume(i18n::cleanup_finished(self.language), self.language)
+        wait_for_enter_then_resume(i18n::cleanup_finished(self.language), self.language)?;
+        // 清理已经执行，结果页里的条目已删：丢弃旧报告，回目标页。
+        self.discard_results();
+        Ok(())
     }
 
     fn edit_current_setting(&mut self) -> Result<(), String> {
@@ -1259,7 +1710,7 @@ impl Session {
     fn refresh_targets(&mut self) {
         // 阈值变了，旧扫描结果不再可信：清空结果页数据并退回目标页。
         self.reports.clear();
-        self.item_rows.clear();
+        self.rows.clear();
         self.item_selected.clear();
         self.results_cursor = 0;
         if self.page == Page::Results {
@@ -1410,6 +1861,14 @@ fn move_index(current: usize, delta: isize, len: usize) -> usize {
     }
 }
 
+/// 一个报告全部条目的体积合计，用于分组头显示。
+fn group_bytes(report: &ScanReport) -> u64 {
+    report
+        .items
+        .iter()
+        .fold(0u64, |total, item| total.saturating_add(item.bytes))
+}
+
 fn fit_to_width(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -1525,9 +1984,27 @@ fn read_line_cooked(prompt: &str) -> Result<String, String> {
     Ok(input)
 }
 
-fn confirm_apply_cooked(language: Language) -> Result<bool, String> {
-    let answer = read_line_cooked(i18n::confirm_apply_prompt(language))?;
-    Ok(answer.trim() == "APPLY")
+fn confirm_apply_cooked(language: Language, summary: &str) -> Result<bool, String> {
+    let prompt = format!("{summary}\n{}", i18n::confirm_apply_prompt(language));
+    let answer = read_line_cooked(&prompt)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes" | "apply"))
+}
+
+/// 整批清理的确认摘要：几个目标、几条命令。
+fn plan_summary(targets: &[CleanupTarget], language: Language) -> String {
+    let command_count: usize = targets
+        .iter()
+        .map(|target| target.apply_commands.len())
+        .sum();
+    format!(
+        "{}: {} {} · {} {}",
+        i18n::tr(language, "将执行", "Will execute"),
+        command_count,
+        i18n::tr(language, "条清理命令", "cleanup commands"),
+        targets.len(),
+        i18n::tr(language, "个目标", "targets")
+    )
 }
 
 fn wait_for_enter_then_resume(message: &str, language: Language) -> Result<(), String> {
@@ -1650,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn results_page_supports_item_toggles() {
+    fn results_page_groups_rows_and_toggles_groups() {
         use crate::model::{CleanerOptions, ScanItem};
         use crate::rules::all_targets;
         use std::path::PathBuf;
@@ -1666,25 +2143,50 @@ mod tests {
                 path: PathBuf::from(path),
                 bytes: 1024,
                 entries: 2,
+                note: None,
+                kind: crate::model::ItemKind::Path,
             });
         }
 
         session.open_results_page(vec![report]);
         assert_eq!(session.page, Page::Results);
-        assert_eq!(session.item_rows.len(), 2);
+        // 分组头 + 两个条目行
+        assert_eq!(session.rows.len(), 3);
 
+        // 缓存类目标（中风险）进入结果页即默认勾选，不用逐项再选
+        assert!(session.item_selected[1]);
+        assert!(session.item_selected[2]);
+
+        // 光标在分组头上按空格：整组取消
+        session
+            .handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+            .unwrap();
+        assert!(!session.item_selected[1]);
+        assert!(!session.item_selected[2]);
+
+        // 再按一次：整组勾选
+        session
+            .handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+            .unwrap();
+        assert!(session.item_selected[1]);
+        assert!(session.item_selected[2]);
+
+        // 单条勾选：移到条目行后按空格只改这一行
         session
             .handle_key(KeyCode::Down, KeyModifiers::empty())
             .unwrap();
         session
             .handle_key(KeyCode::Char(' '), KeyModifiers::empty())
             .unwrap();
-        assert!(session.item_selected[1]);
+        assert!(!session.item_selected[1]);
+        assert!(session.item_selected[2]);
 
         session
             .handle_key(KeyCode::Char('a'), KeyModifiers::empty())
             .unwrap();
-        assert!(session.item_selected.iter().all(|selected| *selected));
+        // 分组行的勾选位无意义（恒为 false），只看条目行
+        assert!(session.item_selected[1]);
+        assert!(session.item_selected[2]);
         session
             .handle_key(KeyCode::Char('n'), KeyModifiers::empty())
             .unwrap();
@@ -1694,6 +2196,57 @@ mod tests {
             .handle_key(KeyCode::Tab, KeyModifiers::empty())
             .unwrap();
         assert_eq!(session.page, Page::Targets);
+    }
+
+    #[test]
+    fn select_all_skips_high_risk_groups() {
+        use crate::model::{CleanerOptions, ScanItem};
+        use crate::rules::all_targets;
+        use std::path::PathBuf;
+
+        let mut session = Session::new(Language::ZhCn);
+        let targets = all_targets(&CleanerOptions::default());
+        let mut reports = Vec::new();
+        for (target_id, path) in [
+            ("user-cache", "/home/demo/.cache/old-a"),
+            ("old-downloads", "/home/demo/Downloads/old.iso"),
+        ] {
+            let target = targets
+                .iter()
+                .find(|target| target.id == target_id)
+                .unwrap()
+                .clone();
+            let mut report = crate::model::ScanReport::new(&target);
+            report.items.push(ScanItem {
+                path: PathBuf::from(path),
+                bytes: 1024,
+                entries: 1,
+                note: None,
+                kind: crate::model::ItemKind::Path,
+            });
+            reports.push(report);
+        }
+
+        session.open_results_page(reports);
+        // 行结构：分组头 + 条目 × 2 组
+        assert_eq!(session.rows.len(), 4);
+
+        // 默认勾选只覆盖低/中风险组；高风险组（old-downloads）不动
+        assert!(session.item_selected[1]);
+        assert!(!session.item_selected[3]);
+
+        session
+            .handle_key(KeyCode::Char('a'), KeyModifiers::empty())
+            .unwrap();
+        assert!(session.item_selected[1]);
+        assert!(!session.item_selected[3]);
+
+        // 逐项清理仍然允许：移到高风险条目上手动勾选
+        session.results_cursor = 3;
+        session
+            .handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+            .unwrap();
+        assert!(session.item_selected[3]);
     }
 
     #[test]

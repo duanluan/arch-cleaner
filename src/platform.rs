@@ -145,6 +145,70 @@ pub fn count_non_empty_lines(text: &str) -> usize {
     text.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
+/// 读取当前所有进程的进程名（/proc/<pid>/comm，小写）。
+/// 与清理脚本里 `pgrep -x <name>` 匹配的是同一个东西，扫描端的
+/// “应用正在运行”判定用它保持两边行为一致。
+pub fn running_process_names() -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return names;
+    };
+
+    for entry in entries.flatten() {
+        if !is_proc_pid_entry(&entry.file_name()) {
+            continue;
+        }
+        let comm_path = Path::new("/proc").join(entry.file_name()).join("comm");
+        let Ok(raw) = fs::read_to_string(&comm_path) else {
+            continue;
+        };
+        if let Some(name) = raw.lines().next() {
+            let name = name.trim().to_ascii_lowercase();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+    }
+
+    names
+}
+
+/// 读取当前所有进程的完整命令行（/proc/<pid>/cmdline，NUL 分隔转空格）。
+/// 进程名（comm）不够用的场合使用，例如识别 Gradle 守护进程。
+pub fn running_process_cmdlines() -> Vec<String> {
+    let mut cmdlines = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return cmdlines;
+    };
+
+    for entry in entries.flatten() {
+        if !is_proc_pid_entry(&entry.file_name()) {
+            continue;
+        }
+        let cmdline_path = Path::new("/proc").join(entry.file_name()).join("cmdline");
+        let Ok(raw) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        let line = raw
+            .split(|byte| *byte == 0)
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !line.trim().is_empty() {
+            cmdlines.push(line);
+        }
+    }
+
+    cmdlines
+}
+
+fn is_proc_pid_entry(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 pub fn path_display(path: &Path) -> String {
     shell_quote(path.as_os_str())
 }

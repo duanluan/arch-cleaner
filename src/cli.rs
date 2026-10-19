@@ -669,7 +669,10 @@ fn confirm_apply(language: Language) -> Result<bool, String> {
         .read_line(&mut answer)
         .map_err(|error| format!("could not read confirmation: {error}"))?;
 
-    Ok(answer.trim() == "APPLY")
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "apply"
+    ))
 }
 
 /// CLI 帮助文案放在 cli 而不是 i18n：目标清单从注册表生成，

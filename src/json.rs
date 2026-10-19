@@ -52,7 +52,7 @@ pub fn scan_reports(
         json.push_str(",\"estimated_items\":");
         push_optional_usize(&mut json, report.estimated_items);
         json.push_str(",\"items\":");
-        push_items(&mut json, &report.items);
+        push_items(&mut json, &report.items, language);
         json.push_str(",\"details\":");
         push_string_array(&mut json, &report.details);
         json.push_str(",\"warnings\":");
@@ -286,7 +286,7 @@ fn push_string_field(json: &mut String, key: &str, value: &str) {
     push_string(json, value);
 }
 
-fn push_items(json: &mut String, items: &[ScanItem]) {
+fn push_items(json: &mut String, items: &[ScanItem], language: Language) {
     json.push('[');
 
     for (index, item) in items.iter().enumerate() {
@@ -298,6 +298,13 @@ fn push_items(json: &mut String, items: &[ScanItem]) {
         push_string_field(json, "path", &item.path.to_string_lossy());
         write!(json, ",\"bytes\":{}", item.bytes).expect("write to string cannot fail");
         write!(json, ",\"entries\":{}", item.entries).expect("write to string cannot fail");
+        if item.kind == crate::model::ItemKind::Package {
+            json.push_str(",\"kind\":\"package\"");
+        }
+        if let Some(note) = &item.note {
+            json.push_str(",\"note\":");
+            push_string(json, note.get(language));
+        }
         json.push('}');
     }
 
@@ -402,6 +409,8 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/cache dir"),
             bytes: 1024,
             entries: 3,
+            note: None,
+            kind: crate::model::ItemKind::Path,
         });
 
         let json = scan_reports(&[report], &options, Language::En);
@@ -409,6 +418,56 @@ mod tests {
         assert!(
             json.contains("\"items\":[{\"path\":\"/tmp/cache dir\",\"bytes\":1024,\"entries\":3}]")
         );
+    }
+
+    #[test]
+    fn serializes_package_item_kind() {
+        let options = CleanerOptions::default();
+        let targets = all_targets(&options);
+        let mut report = ScanReport::new(&targets[0]);
+        report.items.push(ScanItem {
+            path: std::path::PathBuf::from("firefox"),
+            bytes: 1024,
+            entries: 1,
+            note: None,
+            kind: crate::model::ItemKind::Package,
+        });
+
+        let json = scan_reports(&[report], &options, Language::En);
+
+        assert!(json.contains("\"kind\":\"package\""));
+        // 路径条目不输出 kind 字段，保持向后兼容
+        let mut path_report = ScanReport::new(&targets[0]);
+        path_report.items.push(ScanItem {
+            path: std::path::PathBuf::from("/tmp/cache"),
+            bytes: 1,
+            entries: 1,
+            note: None,
+            kind: crate::model::ItemKind::Path,
+        });
+        let json = scan_reports(&[path_report], &options, Language::En);
+        assert!(!json.contains("\"kind\""));
+    }
+
+    #[test]
+    fn serializes_scan_report_item_note() {
+        let options = CleanerOptions::default();
+        let targets = all_targets(&options);
+        let mut report = ScanReport::new(&targets[0]);
+        report.items.push(ScanItem {
+            path: std::path::PathBuf::from("/tmp/cache dir"),
+            bytes: 1024,
+            entries: 3,
+            note: Some(crate::model::NoteText::owned(
+                "应用缓存，自动重建",
+                "App cache; rebuilt automatically",
+            )),
+            kind: crate::model::ItemKind::Path,
+        });
+
+        let json = scan_reports(&[report], &options, Language::En);
+
+        assert!(json.contains("\"note\":\"App cache; rebuilt automatically\""));
     }
 
     #[test]

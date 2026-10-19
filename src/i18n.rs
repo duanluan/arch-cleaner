@@ -129,9 +129,13 @@ pub fn picker_only_hint(language: Language, ids: &str) -> String {
 pub fn results_help_line(language: Language) -> &'static str {
     tr(
         language,
-        "方向键移动 | 空格勾选 | c 清理勾选项 | a/n 全选/全不选 | Tab 返回",
-        "Arrows move | Space toggle | c clean selected | a/n all/none | Tab back",
+        "↑↓/j/k 移动 | 空格 勾选 | t 勾选整组 | a/n 全选/全不选（全选跳过高风险）| PgUp/PgDn 翻页 | c 清理 | Tab 返回",
+        "Up/Down move | Space toggle | t toggle group | a/n all/none (all skips high risk) | PgUp/PgDn page | c clean | Tab back",
     )
+}
+
+pub fn scanning_page_title(language: Language) -> &'static str {
+    tr(language, "扫描中", "Scanning")
 }
 
 pub fn scan_skipped(language: Language) -> &'static str {
@@ -161,8 +165,8 @@ pub fn aborted(language: Language) -> &'static str {
 pub fn confirm_apply_prompt(language: Language) -> &'static str {
     tr(
         language,
-        "输入 APPLY 以执行所选清理命令：",
-        "Type APPLY to execute selected cleanup commands: ",
+        "输入 y 执行清理，输入其他任意字符取消：",
+        "Type y to execute the cleanup, anything else to cancel: ",
     )
 }
 
@@ -181,8 +185,8 @@ pub fn cli_prompt_action(language: Language) -> &'static str {
 pub fn help_line(language: Language) -> &'static str {
     tr(
         language,
-        "方向键移动 | 空格勾选 | Enter/s 扫描 | c 清理 | Tab 设置 | a 全选 | n 全不选",
-        "Arrows move | Space toggle | Enter/s scan | c clean | Tab settings | a all | n none",
+        "↑↓/j/k 移动 | 空格 勾选 | Enter/s 扫描 | c 清理 | Tab 设置 | a/n 全选/全不选 | PgUp/PgDn 翻页",
+        "Up/Down move | Space toggle | Enter/s scan | c clean | Tab settings | a/n all/none | PgUp/PgDn page",
     )
 }
 

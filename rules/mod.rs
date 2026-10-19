@@ -9,23 +9,31 @@ use sha2::{Digest, Sha256};
 
 use crate::i18n::{self, Language};
 use crate::model::{
-    CleanerOptions, CleanupCommand, CleanupTarget, LocalizedText, RiskLevel, ScanItem, ScanReport,
-    ScanStatus, TargetGroup,
+    CleanerOptions, CleanupCommand, CleanupTarget, ItemKind, LocalizedText, NoteText, RiskLevel,
+    ScanItem, ScanReport, ScanStatus, TargetGroup,
 };
 use crate::platform::{
     command_exists, count_non_empty_lines, dir_size, format_bytes, home_dir, is_ignorable_io_error,
     output_text, parse_human_bytes, path_display, run_capture, run_capture_with_env,
+    running_process_cmdlines, running_process_names,
 };
 
 pub fn all_targets(options: &CleanerOptions) -> Vec<CleanupTarget> {
     vec![
         pacman_cache(options),
         orphan_packages(),
+        large_packages(),
+        docker_unused_images(),
         systemd_journal(options),
         user_cache(options),
         ai_agent_caches(options),
+        pnpm_store(),
+        conda_cache(),
+        gradle_cache(),
+        jetbrains_stale_versions(),
         temporary_files(options),
         thumbnail_cache(),
+        trash(),
         crash_dumps(),
         old_downloads(options),
         large_files(options),
@@ -87,7 +95,12 @@ pub fn item_removal_target(items: &[ScanItem], needs_sudo: bool) -> Result<Clean
         args.push(path_text.clone());
 
         commands.push(CleanupCommand::new(
-            format!("{program} rm -rf -- {}", path_display(&item.path)),
+            // display 与 argv 一致：非 sudo 就是 `rm -rf --`，别把程序名重复一遍。
+            if needs_sudo {
+                format!("sudo rm -rf -- {}", path_display(&item.path))
+            } else {
+                format!("rm -rf -- {}", path_display(&item.path))
+            },
             program,
             args,
             needs_sudo,
@@ -153,8 +166,8 @@ fn pacman_cache(options: &CleanerOptions) -> CleanupTarget {
             en: "Pacman package cache",
         },
         description: LocalizedText {
-            zh_cn: "删除旧的包归档，保留最近版本以便回滚。",
-            en: "Remove old package archives while keeping recent versions for rollback.",
+            zh_cn: "删除旧的包归档（保留最近版本以便回滚），并清掉已不在本机的包留下的缓存。",
+            en: "Remove old package archives (keeping recent versions for rollback) and cached packages that are no longer installed.",
         },
         group: TargetGroup::Packages,
         risk: RiskLevel::Low,
@@ -167,18 +180,29 @@ fn pacman_cache(options: &CleanerOptions) -> CleanupTarget {
             )
         },
         scan: scan_pacman_cache,
-        dry_run_commands: vec![CleanupCommand::new(
-            format!("paccache -d -k {keep}"),
-            "paccache",
-            ["-d", "-k", keep.as_str()],
-            false,
-        )],
-        apply_commands: vec![CleanupCommand::new(
-            format!("sudo paccache -r -k {keep}"),
-            "sudo",
-            ["paccache", "-r", "-k", keep.as_str()],
-            true,
-        )],
+        dry_run_commands: vec![
+            CleanupCommand::new(
+                format!("paccache -d -k {keep}"),
+                "paccache",
+                ["-d", "-k", keep.as_str()],
+                false,
+            ),
+            // -ruk0：已不在本机的包留下的缓存归档，全部可删（对应
+            // pacman -Sc 的语义，但由 paccache 统一处理）。
+            // -ruk0：已不在本机的包留下的缓存归档，全部可删（对应
+            // pacman -Sc 的语义）。-r/-d 是互斥的“操作”，-u 是过滤器：
+            // dry-run 用 -duk0，apply 用 -ruk0。
+            CleanupCommand::new("paccache -duk0", "paccache", ["-duk0"], false),
+        ],
+        apply_commands: vec![
+            CleanupCommand::new(
+                format!("sudo paccache -r -k {keep}"),
+                "sudo",
+                ["paccache", "-r", "-k", keep.as_str()],
+                true,
+            ),
+            CleanupCommand::new("sudo paccache -ruk0", "sudo", ["paccache", "-ruk0"], true),
+        ],
     }
 }
 
@@ -468,9 +492,11 @@ fn user_cache(options: &CleanerOptions) -> CleanupTarget {
     let cache_dir = home_dir()
         .map(|path| path.join(".cache"))
         .unwrap_or_else(|| PathBuf::from("$HOME/.cache"));
-    let cache_dir_arg = cache_dir.to_string_lossy().to_string();
     let min_age = format!("+{}", options.user_cache_min_age_days);
-    let display_path = path_display(&cache_dir);
+    // 展示用逐字脚本（与 sh -c 实际执行的完全一致）：排除项和
+    // “应用正在运行则跳过”的守卫都在脚本原文里，审计以脚本为准。
+    let dry_run_script = user_cache_script(&cache_dir, &min_age, false);
+    let apply_script = user_cache_script(&cache_dir, &min_age, true);
 
     CleanupTarget {
         id: "user-cache",
@@ -479,8 +505,8 @@ fn user_cache(options: &CleanerOptions) -> CleanupTarget {
             en: "User cache",
         },
         description: LocalizedText {
-            zh_cn: "清理较旧的顶层用户缓存目录，排除已有单独目标的缓存。",
-            en: "Remove old top-level user cache directories, excluding caches handled by dedicated targets.",
+            zh_cn: "清理较旧的顶层用户缓存目录，排除已有单独目标的缓存；应用正在运行时跳过其缓存。",
+            en: "Remove old top-level user cache directories, excluding caches handled by dedicated targets; caches of running apps are skipped.",
         },
         group: TargetGroup::User,
         risk: RiskLevel::Medium,
@@ -493,67 +519,147 @@ fn user_cache(options: &CleanerOptions) -> CleanupTarget {
             )
         },
         scan: scan_user_cache,
-        dry_run_commands: vec![user_cache_find_command(
-            &cache_dir_arg,
-            &display_path,
-            &min_age,
+        dry_run_commands: vec![CleanupCommand::shell(
+            dry_run_script.clone(),
+            dry_run_script,
             false,
         )],
-        apply_commands: vec![user_cache_find_command(
-            &cache_dir_arg,
-            &display_path,
-            &min_age,
-            true,
+        apply_commands: vec![CleanupCommand::shell(
+            apply_script.clone(),
+            apply_script,
+            false,
         )],
     }
 }
 
-fn user_cache_find_command(
-    cache_dir_arg: &str,
-    display_path: &str,
-    min_age: &str,
-    apply: bool,
-) -> CleanupCommand {
-    let mut display =
-        format!("find {display_path} -xdev -mindepth 1 -maxdepth 1 -type d -mtime {min_age}");
-    let mut args = vec![
-        cache_dir_arg.to_string(),
-        "-xdev".to_string(),
-        "-mindepth".to_string(),
-        "1".to_string(),
-        "-maxdepth".to_string(),
-        "1".to_string(),
-        "-type".to_string(),
-        "d".to_string(),
-        "-mtime".to_string(),
-        min_age.to_string(),
-    ];
+/// `~/.cache` 顶层目录名 → 进程名（comm，与 `pgrep -x` 匹配同一对象）。
+/// 扫描端和清理脚本共用这一份表：应用正在运行时，扫描不把它列为
+/// 候选，脚本也跳过它，两边行为保持一致。
+const USER_CACHE_IN_USE_DIRS: &[(&str, &[&str])] = &[
+    ("microsoft-edge", &["msedge"]),
+    ("google-chrome", &["chrome"]),
+    ("chromium", &["chromium"]),
+    ("mozilla", &["firefox", "firefox-bin", "firefox-esr"]),
+    ("qq", &["qq"]),
+];
 
+fn user_cache_in_use_processes(cache_name: &str) -> Option<&'static [&'static str]> {
+    USER_CACHE_IN_USE_DIRS
+        .iter()
+        .find(|(name, _)| *name == cache_name)
+        .map(|(_, processes)| *processes)
+}
+
+fn is_process_name_running(running: &[String], processes: &[&str]) -> bool {
+    processes
+        .iter()
+        .any(|process| running.iter().any(|name| name.as_str() == *process))
+}
+
+/// 生成 user-cache 的清理脚本：逐个处理 ~/.cache 顶层目录，
+/// 命中“正在运行”表的目录在执行时用 pgrep 再查一遍，运行中就跳过。
+fn user_cache_script(cache_dir: &Path, min_age: &str, apply: bool) -> String {
+    let mut script = String::from("set -efu\n");
+    script.push_str(&format!("cache={}\n", path_display(cache_dir)));
+    script.push_str("[ -d \"$cache\" ] || exit 0\n");
+    script.push_str("find \"$cache\" -xdev -mindepth 1 -maxdepth 1 -type d -mtime ");
+    script.push_str(min_age);
     for name in user_cache_excluded_names() {
-        display.push_str(&format!(" -not -iname '{name}'"));
-        args.push("-not".to_string());
-        args.push("-iname".to_string());
-        args.push((*name).to_string());
+        script.push_str(&format!(" -not -iname '{name}'"));
     }
-
+    script.push_str(" -print0 |\n");
+    script.push_str("while IFS= read -r -d '' dir; do\n");
+    script.push_str("  name=${dir##*/}\n");
+    script.push_str("  processes=\n");
+    script.push_str("  case \"$name\" in\n");
+    for (cache_name, process_names) in USER_CACHE_IN_USE_DIRS {
+        script.push_str(&format!(
+            "    {}) processes='{}' ;;\n",
+            cache_name,
+            process_names.join(" ")
+        ));
+    }
+    script.push_str("  esac\n");
+    script.push_str("  if [ -n \"$processes\" ]; then\n");
+    script.push_str("    command -v pgrep >/dev/null 2>&1 || continue\n");
+    script.push_str("    running=0\n");
+    script.push_str("    for process in $processes; do\n");
+    script.push_str("      if pgrep -x \"$process\" >/dev/null 2>&1; then running=1; break; fi\n");
+    script.push_str("    done\n");
+    script.push_str("    if [ \"$running\" -eq 1 ]; then continue; fi\n");
+    script.push_str("  fi\n");
     if apply {
-        display.push_str(" -exec rm -rf -- {} +");
-        args.extend(
-            ["-exec", "rm", "-rf", "--", "{}", "+"]
-                .into_iter()
-                .map(String::from),
-        );
+        script.push_str("  rm -rf -- \"$dir\"\n");
     } else {
-        display.push_str(" -print");
-        args.push("-print".to_string());
+        script.push_str("  printf '%s\\n' \"$dir\"\n");
     }
+    script.push_str("done\n");
+    script
+}
 
-    CleanupCommand::new(display, "find", args, false)
+/// ~/.cache 常见顶层目录的用途说明，扫描时按目录名匹配。
+/// 认不出来的名字给通用的 XDG 解释：.cache 本就是“可随时重建”
+/// 的约定目录，这句话对大多数情况成立。
+fn user_cache_note(name: &str) -> LocalizedText {
+    let lower = name.to_ascii_lowercase();
+    let (zh_cn, en): (&str, &str) = match lower.as_str() {
+        "microsoft-edge" | "google-chrome" | "chromium" | "brave" | "vivaldi" | "opera" => (
+            "浏览器缓存（网页资源），删除后网站首次打开稍慢",
+            "Browser cache (web assets); sites load a bit slower on first visit",
+        ),
+        "mozilla" | "firefox" => ("Firefox 浏览器缓存", "Firefox browser cache"),
+        "gstreamer-1.0" => (
+            "多媒体解码器注册缓存，自动重建",
+            "GStreamer codec registry cache; rebuilt automatically",
+        ),
+        "fontconfig" => ("字体缓存，自动重建", "Font cache; rebuilt automatically"),
+        "mesa_shader_cache" | "nvidia" | "gpu_cache" => (
+            "显卡着色器编译缓存，重建需要一点时间",
+            "GPU shader cache; takes a moment to rebuild",
+        ),
+        "pip" => (
+            "Python 包下载缓存，重装包时需重新下载",
+            "Python package download cache; packages re-download on install",
+        ),
+        "go-build" => (
+            "Go 构建缓存，重新编译需要时间",
+            "Go build cache; rebuilds on demand",
+        ),
+        "yarn" => ("yarn 包下载缓存", "yarn package download cache"),
+        "electron" => ("Electron 安装包下载缓存", "Electron download cache"),
+        _ if is_kde_component(&lower) => (
+            "KDE 桌面组件缓存，自动重建",
+            "KDE Plasma component cache; rebuilt automatically",
+        ),
+        _ => (
+            "应用缓存；按 XDG 约定可删除，应用会自动重建",
+            "App cache; safe to remove by the XDG convention, apps rebuild it",
+        ),
+    };
+    LocalizedText { zh_cn, en }
+}
+
+fn is_kde_component(lower_name: &str) -> bool {
+    lower_name.starts_with("plasma")
+        || lower_name.starts_with("polkit-kde")
+        || lower_name.starts_with("xdg-desktop-portal-kde")
+        || matches!(
+            lower_name,
+            "kwin"
+                | "krunner"
+                | "ksplash"
+                | "dolphin"
+                | "baloo"
+                | "kscreen"
+                | "ksycoca5"
+                | "ksycoca6"
+        )
 }
 
 fn user_cache_excluded_names() -> &'static [&'static str] {
     &[
         "thumbnails",
+        "jetbrains",
         "claude",
         "codex",
         "opencode",
@@ -753,6 +859,589 @@ fn crash_dumps() -> CleanupTarget {
             true,
         )],
     }
+}
+
+fn pnpm_store() -> CleanupTarget {
+    CleanupTarget {
+        id: "pnpm-store",
+        title: LocalizedText {
+            zh_cn: "pnpm store",
+            en: "pnpm store",
+        },
+        description: LocalizedText {
+            zh_cn: "用官方命令 pnpm store prune 清理内容仓库中没有被任何项目引用的包。不直接删除 store 目录：pnpm 的仓库状态只能由它自己维护。",
+            en: "Prune unreferenced packages from the content-addressable store via the official `pnpm store prune`. The store directory is never removed directly; only pnpm itself may manage its state.",
+        },
+        group: TargetGroup::Developer,
+        risk: RiskLevel::Low,
+        requires_sudo: false,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(language, "仅清理无引用的包", "Unreferenced packages only").to_string()
+        },
+        scan: scan_pnpm_store,
+        dry_run_commands: vec![CleanupCommand::new(
+            "pnpm store path",
+            "pnpm",
+            ["store", "path"],
+            false,
+        )],
+        apply_commands: vec![CleanupCommand::new(
+            "pnpm store prune",
+            "pnpm",
+            ["store", "prune"],
+            false,
+        )],
+    }
+}
+
+fn conda_cache() -> CleanupTarget {
+    let conda = conda_executable();
+
+    CleanupTarget {
+        id: "conda-cache",
+        title: LocalizedText {
+            zh_cn: "conda 包缓存",
+            en: "Conda package cache",
+        },
+        description: LocalizedText {
+            zh_cn: "用官方命令 conda clean --all 清理未使用的包压缩档、索引缓存和源码包。由 conda 判断哪些包仍被环境引用，不直接删除 pkgs 目录。",
+            en: "Clean unused package tarballs, index caches, and source packages via the official `conda clean --all`. Conda decides which packages are still referenced by environments; the pkgs directory is never removed directly.",
+        },
+        group: TargetGroup::Developer,
+        risk: RiskLevel::Low,
+        requires_sudo: false,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(
+                language,
+                "按 conda clean --all 官方规则",
+                "Per the official conda clean --all rules",
+            )
+            .to_string()
+        },
+        scan: scan_conda_cache,
+        // conda clean --dry-run 按设计以退出码 1 结束，无法作为只读检查
+        // 命令区分成功与失败，所以不提供 dry-run 命令，以扫描结果为准。
+        dry_run_commands: Vec::new(),
+        apply_commands: vec![CleanupCommand::new(
+            format!("{conda} clean --all -y"),
+            conda.clone(),
+            ["clean", "--all", "-y"],
+            false,
+        )],
+    }
+}
+
+fn gradle_cache() -> CleanupTarget {
+    let caches_dir = home_dir()
+        .map(|path| path.join(".gradle").join("caches"))
+        .unwrap_or_else(|| PathBuf::from("$HOME/.gradle/caches"));
+    let caches_arg = caches_dir.to_string_lossy().to_string();
+    let display_path = path_display(&caches_dir);
+
+    CleanupTarget {
+        id: "gradle-cache",
+        title: LocalizedText {
+            zh_cn: "Gradle 缓存",
+            en: "Gradle cache",
+        },
+        description: LocalizedText {
+            zh_cn: "删除 ~/.gradle/caches，下次构建时按需重新下载。Gradle 进程运行期间不提供候选，请在构建结束后于扫描结果页逐项勾选清理。",
+            en: "Remove ~/.gradle/caches; dependencies are re-downloaded on the next build. No candidate is offered while a Gradle process runs; rescan after builds finish and clean it in the scan results page.",
+        },
+        group: TargetGroup::Developer,
+        risk: RiskLevel::Medium,
+        requires_sudo: false,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(
+                language,
+                "整目录删除，下次构建重建",
+                "Whole-directory removal; rebuilt on next build",
+            )
+            .to_string()
+        },
+        scan: scan_gradle_cache,
+        dry_run_commands: vec![CleanupCommand::new(
+            format!("find {display_path} -xdev -mindepth 1 -maxdepth 1 -print"),
+            "find",
+            [
+                caches_arg.as_str(),
+                "-xdev",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+            ],
+            false,
+        )],
+        // 逐项清理专用：Gradle 是否在运行只有在扫描时才知道，
+        // 删除一律走扫描结果页，不提供整批命令。
+        apply_commands: Vec::new(),
+    }
+}
+
+fn jetbrains_stale_versions() -> CleanupTarget {
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("$HOME"));
+    let cache_base = home.join(".cache/JetBrains");
+    let share_base = home.join(".local/share/JetBrains");
+    let mut dry_run_commands = Vec::new();
+    for base in [&cache_base, &share_base] {
+        let base_arg = base.to_string_lossy().to_string();
+        dry_run_commands.push(CleanupCommand::new(
+            format!(
+                "find {} -xdev -mindepth 1 -maxdepth 1 -print",
+                path_display(base)
+            ),
+            "find",
+            [
+                base_arg.as_str(),
+                "-xdev",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+            ],
+            false,
+        ));
+    }
+
+    CleanupTarget {
+        id: "jetbrains-stale",
+        title: LocalizedText {
+            zh_cn: "JetBrains 旧版本数据",
+            en: "JetBrains stale version data",
+        },
+        description: LocalizedText {
+            zh_cn: "找出 IDE 升级后残留的旧版本缓存和插件目录（~/.cache/JetBrains、~/.local/share/JetBrains 下版本号已不在本机的目录）。设置目录（~/.config/JetBrains）不动，需要导入旧设置时仍可用。请在扫描结果页逐项勾选后清理。",
+            en: "Find cache and plugin directories left behind by IDE upgrades (directories under ~/.cache/JetBrains and ~/.local/share/JetBrains whose version is no longer installed). Settings directories (~/.config/JetBrains) are left intact for later import. Clean entries one by one in the scan results page.",
+        },
+        group: TargetGroup::Developer,
+        risk: RiskLevel::Medium,
+        requires_sudo: false,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(
+                language,
+                "仅版本已不在本机的目录",
+                "Only directories of versions no longer installed",
+            )
+            .to_string()
+        },
+        scan: scan_jetbrains_stale,
+        dry_run_commands,
+        // 逐项清理专用：是否“在用/在运行”只有扫描时才能判定，
+        // 删除一律走扫描结果页的逐条 rm 命令。
+        apply_commands: Vec::new(),
+    }
+}
+
+fn trash() -> CleanupTarget {
+    let trash_dir = home_dir()
+        .map(|path| path.join(".local/share/Trash"))
+        .unwrap_or_else(|| PathBuf::from("$HOME/.local/share/Trash"));
+    let trash_arg = trash_dir.to_string_lossy().to_string();
+    let display_path = path_display(&trash_dir);
+
+    CleanupTarget {
+        id: "trash",
+        title: LocalizedText {
+            zh_cn: "回收站",
+            en: "Trash",
+        },
+        description: LocalizedText {
+            zh_cn: "清空回收站（~/.local/share/Trash）。清空后无法再从回收站恢复，请先确认里面没有要找回的文件。",
+            en: "Empty the trash (~/.local/share/Trash). Emptied entries can no longer be restored from the trash; check for anything you want back first.",
+        },
+        group: TargetGroup::User,
+        risk: RiskLevel::Medium,
+        requires_sudo: false,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(language, "清空回收站", "Empty the trash").to_string()
+        },
+        scan: scan_trash,
+        dry_run_commands: vec![CleanupCommand::new(
+            format!("find {display_path} -xdev -mindepth 1 -maxdepth 1 -print"),
+            "find",
+            [
+                trash_arg.as_str(),
+                "-xdev",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+            ],
+            false,
+        )],
+        apply_commands: vec![CleanupCommand::new(
+            format!("find {display_path} -xdev -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +"),
+            "find",
+            [
+                trash_arg.as_str(),
+                "-xdev",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-exec",
+                "rm",
+                "-rf",
+                "--",
+                "{}",
+                "+",
+            ],
+            false,
+        )],
+    }
+}
+
+/// 把用户勾选的软件包变成一个可执行的卸载目标。
+/// 安全约束：包名走 stdin 喂给 pacman（与孤儿包目标同一模式），
+/// 不经 shell 展开；pacman 自己解析依赖并在需要时拒绝删除。
+pub fn package_removal_target(items: &[ScanItem]) -> Result<CleanupTarget, String> {
+    if items.is_empty() {
+        return Err("no packages selected".to_string());
+    }
+
+    let mut names = Vec::new();
+    for item in items {
+        let name = item.path.to_string_lossy();
+        // 脚本经 sh -c 执行：包名按 pacman 的合法字符集校验后再拼进
+        // 单引号，名字里出现其他字符（引号、分号）直接拒绝，不给
+        // 注入留口子。正常来源是 pacman -Qi 的输出，这里挡的是
+        // 绕过入口直接改库的调用方。
+        if name.is_empty()
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'+' | b'-')
+            })
+        {
+            return Err(format!("refusing suspicious package name: {name}"));
+        }
+        names.push(name.into_owned());
+    }
+    // 显示用逐字脚本（与 sh -c 实际执行的完全一致）。
+    let script = format!(
+        "printf '%s\\n' {} | sudo pacman -Rns -",
+        names
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    Ok(CleanupTarget {
+        id: "selected-packages",
+        title: LocalizedText {
+            zh_cn: "勾选的软件包",
+            en: "Selected packages",
+        },
+        description: LocalizedText {
+            zh_cn: "仅卸载在扫描结果中勾选的软件包；被其他包依赖时 pacman 会拒绝并说明。",
+            en: "Uninstall only the packages selected in the scan results; pacman refuses and explains when another package depends on them.",
+        },
+        group: TargetGroup::Packages,
+        risk: RiskLevel::High,
+        requires_sudo: true,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(
+                language,
+                "逐项卸载，无统一阈值",
+                "Per-package removal; no shared threshold",
+            )
+            .to_string()
+        },
+        scan: scan_selected_items,
+        dry_run_commands: Vec::new(),
+        apply_commands: vec![CleanupCommand::shell(script.clone(), script, true)],
+    })
+}
+
+fn large_packages() -> CleanupTarget {
+    CleanupTarget {
+        id: "large-packages",
+        title: LocalizedText {
+            zh_cn: "大体积软件包",
+            en: "Large packages",
+        },
+        description: LocalizedText {
+            zh_cn: "列出本机占用最大的已安装包（前 30）。删除前请确认用途：系统组件、驱动、显式安装且常用的软件都不该删。请在扫描结果页逐项勾选后用 pacman -Rns 卸载。",
+            en: "List the largest installed packages (top 30). Confirm what each one is before removing: system components, drivers, and software you deliberately use should stay. Pick entries in the scan results page and uninstall via pacman -Rns.",
+        },
+        group: TargetGroup::Packages,
+        risk: RiskLevel::High,
+        requires_sudo: true,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(
+                language,
+                "前 30 大已安装包",
+                "Top 30 installed packages by size",
+            )
+            .to_string()
+        },
+        scan: scan_large_packages,
+        dry_run_commands: Vec::new(),
+        // 逐项清理专用：卸载一律走扫描结果页的 pacman -Rns（stdin 喂包名）。
+        apply_commands: Vec::new(),
+    }
+}
+
+/// 大体积包清单条目数上限：报告和结果页保持可读。
+const LARGE_PACKAGE_ITEM_LIMIT: usize = 30;
+
+fn scan_large_packages(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+
+    if !command_exists("pacman") {
+        report.status = ScanStatus::MissingTool;
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "未在 PATH 中找到 pacman。",
+                "pacman was not found on PATH.",
+            )
+            .to_string(),
+        );
+        return report;
+    }
+
+    let output = match run_capture_with_env(
+        "pacman",
+        &["-Qi"],
+        &[("LC_ALL", "C"), ("LANG", "C"), ("LANGUAGE", "C")],
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            report.status = ScanStatus::Unavailable;
+            report.warnings.push(format!(
+                "{}: {error}",
+                i18n::tr(
+                    language,
+                    "无法查询已安装包",
+                    "Could not query installed packages"
+                )
+            ));
+            return report;
+        }
+    };
+    if !output.status.success() {
+        report.status = ScanStatus::Unavailable;
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "无法查询已安装包。",
+                "Could not query installed packages.",
+            )
+            .to_string(),
+        );
+        return report;
+    }
+
+    // 汇总只算上榜的前 30 个，和大文件目标同一条规则：数字描述
+    // 用户实际看到的清单，不是全部已安装包的总和。
+    let mut items = parse_pacman_qi_sizes(&output_text(&output));
+    let count = items.len();
+    items.truncate(LARGE_PACKAGE_ITEM_LIMIT);
+    let total = items
+        .iter()
+        .fold(0u64, |sum, item| sum.saturating_add(item.bytes));
+    report.details.push(format!(
+        "{}: {} ({})",
+        i18n::tr(language, "最大的已安装包", "Largest installed packages"),
+        items.len(),
+        format_bytes(total)
+    ));
+    if count > items.len() {
+        report.details.push(format!(
+            "{}: {}",
+            i18n::tr(language, "列表已截断，共", "List truncated of"),
+            count
+        ));
+    }
+    report.details.push(
+        i18n::tr(
+            language,
+            "列表只用于审查：显式安装且常用的软件不该删。",
+            "The list is for review only: software you deliberately use should stay.",
+        )
+        .to_string(),
+    );
+    report.estimated_bytes = Some(total);
+    report.estimated_items = Some(items.len());
+    report.items = items;
+    report
+}
+
+/// 解析 `pacman -Qi`（C locale）块状输出：Name / Installed Size /
+/// Description 三字段。纯函数，便于测试。
+fn parse_pacman_qi_sizes(text: &str) -> Vec<ScanItem> {
+    let mut items = Vec::new();
+    let mut name: Option<String> = None;
+    let mut bytes: Option<u64> = None;
+    let mut description: Option<String> = None;
+
+    let flush = |name: &mut Option<String>,
+                 bytes: &mut Option<u64>,
+                 description: &mut Option<String>,
+                 items: &mut Vec<ScanItem>| {
+        if let (Some(name), Some(bytes)) = (name.take(), bytes.take()) {
+            let note = description
+                .take()
+                .map(|text| NoteText::owned(text.clone(), text));
+            items.push(ScanItem {
+                path: PathBuf::from(name),
+                bytes,
+                entries: 1,
+                note,
+                kind: ItemKind::Package,
+            });
+        } else {
+            description.take();
+        }
+    };
+
+    // pacman -Qi 的字段是 `Name            : value`：字段名和冒号之间
+    // 有可变填充，剥掉字段名后先去空格再剥冒号。
+    fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        line.strip_prefix(name)
+            .map(|rest| rest.trim_start())
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim)
+    }
+
+    for line in text.lines() {
+        if let Some(value) = field(line, "Name") {
+            flush(&mut name, &mut bytes, &mut description, &mut items);
+            name = Some(value.to_string());
+        } else if let Some(value) = field(line, "Installed Size") {
+            bytes = parse_human_bytes(value);
+        } else if let Some(value) = field(line, "Description") {
+            description = Some(value.to_string());
+        }
+    }
+    flush(&mut name, &mut bytes, &mut description, &mut items);
+
+    items.sort_by_key(|item| std::cmp::Reverse(item.bytes));
+    items
+}
+
+fn docker_unused_images() -> CleanupTarget {
+    CleanupTarget {
+        id: "docker-images",
+        title: LocalizedText {
+            zh_cn: "Docker 未用镜像",
+            en: "Docker unused images",
+        },
+        description: LocalizedText {
+            zh_cn: "用官方命令 docker image prune -a 删除没有任何容器在用的镜像。下次构建或拉取时会重新下载。不动已停止的容器和数据卷。",
+            en: "Remove images not used by any container via the official `docker image prune -a`. They re-download on the next build or pull. Stopped containers and volumes are left alone.",
+        },
+        group: TargetGroup::Developer,
+        risk: RiskLevel::Medium,
+        requires_sudo: false,
+        threshold_summary: |_options: &CleanerOptions, language: Language| {
+            i18n::tr(
+                language,
+                "仅删无容器使用的镜像",
+                "Only images without containers",
+            )
+            .to_string()
+        },
+        scan: scan_docker_unused_images,
+        dry_run_commands: Vec::new(),
+        apply_commands: vec![CleanupCommand::new(
+            "docker image prune -a -f",
+            "docker",
+            ["image", "prune", "-a", "-f"],
+            false,
+        )],
+    }
+}
+
+fn scan_docker_unused_images(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+
+    if !command_exists("docker") {
+        report.status = ScanStatus::MissingTool;
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "未在 PATH 中找到 docker。",
+                "docker was not found on PATH.",
+            )
+            .to_string(),
+        );
+        return report;
+    }
+
+    // 守护进程没起时 docker system df 会失败：按“无候选”处理，
+    // 不当作错误——平时不开 docker 的机器不该看到红色警告。
+    let output = match run_capture(
+        "docker",
+        &["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"],
+    ) {
+        Ok(output) if output.status.success() => output,
+        Ok(_) | Err(_) => {
+            report.details.push(
+                i18n::tr(
+                    language,
+                    "Docker 守护进程未运行或不可访问，本次无候选。",
+                    "The Docker daemon is not running or not accessible; no candidates this time.",
+                )
+                .to_string(),
+            );
+            return report;
+        }
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    for line in text.lines() {
+        let Some((kind, reclaimable)) = line.split_once('\t') else {
+            continue;
+        };
+        if kind != "Images" {
+            continue;
+        }
+        // "2.596GB (27%)" → 取前缀的大小部分。
+        let size_text = reclaimable.split('(').next().unwrap_or("").trim();
+        match parse_human_bytes(size_text) {
+            Some(bytes) => {
+                report.estimated_bytes = Some(bytes);
+                report.details.push(format!(
+                    "{}: {}",
+                    i18n::tr(language, "可回收镜像空间", "Reclaimable image space"),
+                    format_bytes(bytes)
+                ));
+            }
+            None => {
+                report.status = ScanStatus::Unavailable;
+                report.warnings.push(
+                    i18n::tr(
+                        language,
+                        "无法解析 docker system df 输出。",
+                        "Could not parse docker system df output.",
+                    )
+                    .to_string(),
+                );
+            }
+        }
+    }
+    report.details.push(
+        i18n::tr(
+            language,
+            "实际释放空间以 docker image prune 的输出为准。",
+            "Actual reclaimed space follows what docker image prune reports.",
+        )
+        .to_string(),
+    );
+    report
 }
 
 fn ai_agent_cleanup_dirs() -> Vec<PathBuf> {
@@ -1066,25 +1755,21 @@ fn scan_pacman_cache(
         return report;
     }
 
-    // Scan reuses the exact argv of the dry-run command shown in the plan, so
-    // the estimate always describes the command the user sees (only the locale
-    // is pinned so the summary line parses stably).
-    let Some(dry_run) = target.dry_run_commands.first() else {
-        report.status = ScanStatus::Unavailable;
-        return report;
-    };
-    let args: Vec<&str> = dry_run.args.iter().map(String::as_str).collect();
-    match run_capture_with_env(
-        &dry_run.program,
-        &args,
-        &[("LC_ALL", "C"), ("LANG", "C"), ("LANGUAGE", "C")],
-    ) {
-        Ok(output) => {
-            let text = output_text(&output);
-            if !output.status.success() {
+    // 扫描复用计划里展示的全部 dry-run 命令并汇总（钉 locale），
+    // 预估永远描述用户看到的命令：-k 旧版本 + -ruk0 未安装包缓存。
+    let mut total = PaccacheDryRunSummary::default();
+    for dry_run in &target.dry_run_commands {
+        let args: Vec<&str> = dry_run.args.iter().map(String::as_str).collect();
+        let output = match run_capture_with_env(
+            &dry_run.program,
+            &args,
+            &[("LC_ALL", "C"), ("LANG", "C"), ("LANGUAGE", "C")],
+        ) {
+            Ok(output) => output,
+            Err(error) => {
                 report.status = ScanStatus::Unavailable;
                 report.warnings.push(format!(
-                    "{}: {text}",
+                    "{}: {error}",
                     i18n::tr(
                         language,
                         "无法查询 pacman 缓存候选项",
@@ -1093,42 +1778,55 @@ fn scan_pacman_cache(
                 ));
                 return report;
             }
+        };
 
-            let parsed = parse_paccache_dry_run(&text);
-            if parsed.candidates.is_none() && parsed.bytes.is_none() {
-                report.status = ScanStatus::Unavailable;
-                report.warnings.push(
-                    i18n::tr(
-                        language,
-                        "无法解析 pacman 缓存候选项摘要。",
-                        "Could not parse pacman cache candidate summary.",
-                    )
-                    .to_string(),
-                );
-            }
-            report.estimated_items = parsed.candidates;
-            report.estimated_bytes = parsed.bytes;
-            if let Some(candidates) = parsed.candidates {
-                report.details.push(format!(
-                    "{}: {candidates}",
-                    i18n::tr(language, "候选包", "Candidate packages")
-                ));
-            }
-            if !text.is_empty() {
-                report.details.push(text);
-            }
-        }
-        Err(error) => {
+        let text = output_text(&output);
+        if !output.status.success() {
             report.status = ScanStatus::Unavailable;
             report.warnings.push(format!(
-                "{}: {error}",
+                "{}: {text}",
                 i18n::tr(
                     language,
                     "无法查询 pacman 缓存候选项",
                     "Could not query pacman cache candidates"
                 )
             ));
+            return report;
         }
+
+        let parsed = parse_paccache_dry_run(&text);
+        if parsed.candidates.is_none() && parsed.bytes.is_none() {
+            report.status = ScanStatus::Unavailable;
+            report.warnings.push(
+                i18n::tr(
+                    language,
+                    "无法解析 pacman 缓存候选项摘要。",
+                    "Could not parse pacman cache candidate summary.",
+                )
+                .to_string(),
+            );
+            return report;
+        }
+        total.candidates = total
+            .candidates
+            .zip(parsed.candidates)
+            .map(|(sum, part)| sum + part);
+        total.bytes = total
+            .bytes
+            .zip(parsed.bytes)
+            .map(|(sum, part)| sum.saturating_add(part));
+        if !text.is_empty() {
+            report.details.push(text);
+        }
+    }
+
+    report.estimated_items = total.candidates;
+    report.estimated_bytes = total.bytes;
+    if let Some(candidates) = total.candidates {
+        report.details.push(format!(
+            "{}: {candidates}",
+            i18n::tr(language, "候选包", "Candidate packages")
+        ));
     }
 
     report
@@ -1336,7 +2034,37 @@ fn scan_user_cache(
         true,
         matches_user_cache_excluded_name,
     ) {
-        Ok(buckets) => add_cleanable_entry_details(&mut report, buckets, language),
+        Ok(buckets) => {
+            // 应用正在运行的缓存目录不列为候选，和清理脚本里的
+            // pgrep 守卫保持同一份判定表。
+            let running = running_process_names();
+            let mut eligible = Vec::new();
+            for mut bucket in buckets {
+                let name = bucket
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let in_use = user_cache_in_use_processes(&name)
+                    .is_some_and(|processes| is_process_name_running(&running, processes));
+                if in_use {
+                    report.warnings.push(format!(
+                        "{}：{name}（{}）",
+                        i18n::tr(
+                            language,
+                            "应用正在运行，已跳过其缓存",
+                            "Skipped because the app is running"
+                        ),
+                        format_bytes(bucket.bytes)
+                    ));
+                } else {
+                    // 目录名对使用者没有信息量，附一句人话说明。
+                    bucket.note = Some(NoteText::from_static(user_cache_note(&name)));
+                    eligible.push(bucket);
+                }
+            }
+            add_cleanable_entry_details(&mut report, eligible, language);
+        }
         Err(error) => push_inspect_warning(&mut report, error, language),
     }
 
@@ -1377,7 +2105,15 @@ fn scan_ai_agent_caches(
         }
 
         match cleanable_files_size(&path, options.ai_agent_min_age_days) {
-            Ok(bucket) if bucket.bytes > 0 || bucket.entries > 0 => buckets.push(bucket),
+            Ok(bucket) if bucket.bytes > 0 || bucket.entries > 0 => {
+                const AGENT_NOTE: LocalizedText = LocalizedText {
+                    zh_cn: "AI 编程工具的缓存、日志或临时产物",
+                    en: "Cache, logs, or temp artifacts from AI coding tools",
+                };
+                let mut bucket = bucket;
+                bucket.note = Some(NoteText::from_static(AGENT_NOTE));
+                buckets.push(bucket)
+            }
             Ok(_) => {}
             Err(error) => report.warnings.push(format!(
                 "{}: {error}",
@@ -1418,7 +2154,16 @@ fn scan_temp_files(
         match top_level_cleanable_entries(root, options.temp_min_age_days, false, |name| {
             matches_temp_file_excluded_entry(name)
         }) {
-            Ok(mut root_buckets) => buckets.append(&mut root_buckets),
+            Ok(mut root_buckets) => {
+                const TEMP_NOTE: LocalizedText = LocalizedText {
+                    zh_cn: "临时目录中很久没动过的文件，一般可安全删除",
+                    en: "Long-untouched entries in temp directories; generally safe to remove",
+                };
+                for bucket in &mut root_buckets {
+                    bucket.note = Some(NoteText::from_static(TEMP_NOTE));
+                }
+                buckets.append(&mut root_buckets);
+            }
             Err(error) => push_inspect_warning(&mut report, error, language),
         }
     }
@@ -1468,6 +2213,530 @@ fn scan_crash_dumps(
         &mut report,
         Path::new("/var/lib/systemd/coredump"),
         i18n::tr(language, "coredump 存储", "Coredump storage"),
+        language,
+    );
+    report
+}
+
+fn scan_pnpm_store(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+
+    if !command_exists("pnpm") {
+        report.status = ScanStatus::MissingTool;
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "未在 PATH 中找到 pnpm。",
+                "pnpm was not found on PATH.",
+            )
+            .to_string(),
+        );
+        return report;
+    }
+
+    // 只解析 stdout：stderr 可能带告警行，混着取会把路径取错。
+    let store_dir = match run_capture("pnpm", &["store", "path"]) {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(PathBuf::from),
+        _ => None,
+    };
+    let Some(store_dir) = store_dir else {
+        report.status = ScanStatus::Unavailable;
+        report.warnings.push(
+            i18n::tr(
+                language,
+                "无法定位 pnpm store。",
+                "Could not locate the pnpm store.",
+            )
+            .to_string(),
+        );
+        return report;
+    };
+
+    add_dir_size(
+        &mut report,
+        &store_dir,
+        i18n::tr(language, "pnpm store", "pnpm store"),
+        language,
+    );
+    report.details.push(
+        i18n::tr(
+            language,
+            "实际释放空间以 pnpm store prune 的输出为准。",
+            "Actual reclaimed space follows what pnpm store prune reports.",
+        )
+        .to_string(),
+    );
+    report
+}
+
+fn conda_executable() -> String {
+    if command_exists("conda") {
+        return "conda".to_string();
+    }
+
+    if let Some(home) = home_dir() {
+        for root in ["miniforge3", "miniconda3", "anaconda3"] {
+            let candidate = home.join(root).join("bin").join("conda");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    "conda".to_string()
+}
+
+/// pkgs 缓存目录：PATH 里的 conda 问 `info --base`，绝对路径的 conda
+/// （<root>/bin/conda）直接回推两级。base 只从 stdout 解析：
+/// stderr 可能带告警行，混着取会把路径取错。
+fn conda_pkgs_dir(conda: &str) -> Option<PathBuf> {
+    let base = if conda == "conda" {
+        let output = run_capture(conda, &["info", "--base"]).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(PathBuf::from)?
+    } else {
+        Path::new(conda).ancestors().nth(2)?.to_path_buf()
+    };
+    let pkgs = base.join("pkgs");
+    pkgs.is_dir().then_some(pkgs)
+}
+
+fn scan_conda_cache(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+
+    let conda = conda_executable();
+    if !command_exists(&conda) {
+        report.status = ScanStatus::MissingTool;
+        report
+            .warnings
+            .push(i18n::tr(language, "未找到 conda。", "conda was not found.").to_string());
+        return report;
+    }
+
+    match conda_pkgs_dir(&conda) {
+        Some(pkgs_dir) => {
+            add_dir_size(
+                &mut report,
+                &pkgs_dir,
+                i18n::tr(language, "包缓存", "Package cache"),
+                language,
+            );
+            report.details.push(
+                i18n::tr(
+                    language,
+                    "实际释放空间以 conda clean --all 的输出为准。",
+                    "Actual reclaimed space follows what conda clean --all reports.",
+                )
+                .to_string(),
+            );
+        }
+        None => {
+            report.details.push(
+                i18n::tr(
+                    language,
+                    "未找到 conda 包缓存目录。",
+                    "No conda package cache directory was found.",
+                )
+                .to_string(),
+            );
+        }
+    }
+
+    report
+}
+
+fn scan_gradle_cache(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+    let Some(caches_dir) = home_dir().map(|path| path.join(".gradle").join("caches")) else {
+        report.status = ScanStatus::Unavailable;
+        report
+            .warnings
+            .push(i18n::tr(language, "未设置 HOME。", "HOME is not set.").to_string());
+        return report;
+    };
+
+    if !caches_dir.exists() {
+        report.estimated_bytes = Some(0);
+        report.details.push(
+            i18n::tr(
+                language,
+                "未找到 ~/.gradle/caches。",
+                "~/.gradle/caches was not found.",
+            )
+            .to_string(),
+        );
+        return report;
+    }
+
+    match dir_size(&caches_dir) {
+        Ok(bytes) => {
+            report.estimated_bytes = Some(bytes);
+            report.details.push(format!(
+                "{}: {}",
+                i18n::tr(language, "Gradle 缓存", "Gradle cache"),
+                format_bytes(bytes)
+            ));
+            if is_gradle_running() {
+                // Gradle 正在运行时不给清理候选，防止删掉守护进程
+                // 正在使用的缓存；构建结束后重新扫描即可。
+                report.warnings.push(
+                    i18n::tr(
+                        language,
+                        "检测到 Gradle 进程正在运行，本次不提供清理候选；请构建结束后重新扫描。",
+                        "A Gradle process is running, so no candidate is offered; rescan after builds finish.",
+                    )
+                    .to_string(),
+                );
+            } else {
+                const GRADLE_NOTE: LocalizedText = LocalizedText {
+                    zh_cn: "Gradle 构建缓存；删除后下次构建会重新下载依赖",
+                    en: "Gradle build cache; dependencies re-download on the next build",
+                };
+                report.items.push(ScanItem {
+                    path: caches_dir,
+                    bytes,
+                    entries: 1,
+                    note: Some(NoteText::from_static(GRADLE_NOTE)),
+                    kind: ItemKind::Path,
+                });
+                report.estimated_items = Some(1);
+            }
+        }
+        Err(error) => push_inspect_warning(&mut report, error, language),
+    }
+
+    report
+}
+
+/// Gradle 守护进程的进程名是 java，单看 comm 认不出来，
+/// 还要匹配完整命令行里的守护进程主类。
+fn is_gradle_running() -> bool {
+    if running_process_names().iter().any(|name| name == "gradle") {
+        return true;
+    }
+    running_process_cmdlines()
+        .iter()
+        .any(|line| line.contains("org.gradle.launcher.daemon"))
+}
+
+/// JetBrains 产品表：数据目录前缀、进程名守卫、product-info.json 的
+/// productCode。三者共同决定“目录属于哪个产品、是否在用、是否在运行”。
+struct JetBrainsProduct {
+    data_prefix: &'static str,
+    comm_names: &'static [&'static str],
+    product_codes: &'static [&'static str],
+}
+
+const JETBRAINS_PRODUCTS: &[JetBrainsProduct] = &[
+    JetBrainsProduct {
+        data_prefix: "IntelliJIdea",
+        comm_names: &["idea"],
+        product_codes: &["IU"],
+    },
+    JetBrainsProduct {
+        data_prefix: "IdeaIC",
+        comm_names: &["idea"],
+        product_codes: &["IC"],
+    },
+    JetBrainsProduct {
+        data_prefix: "PyCharm",
+        comm_names: &["pycharm"],
+        product_codes: &["PY"],
+    },
+    JetBrainsProduct {
+        data_prefix: "RustRover",
+        comm_names: &["rust-rover", "rustrover"],
+        product_codes: &["RR"],
+    },
+    JetBrainsProduct {
+        data_prefix: "WebStorm",
+        comm_names: &["webstorm"],
+        product_codes: &["WS"],
+    },
+    JetBrainsProduct {
+        data_prefix: "CLion",
+        comm_names: &["clion"],
+        product_codes: &["CL"],
+    },
+    JetBrainsProduct {
+        data_prefix: "GoLand",
+        comm_names: &["goland"],
+        product_codes: &["GO"],
+    },
+    JetBrainsProduct {
+        data_prefix: "Rider",
+        comm_names: &["rider"],
+        product_codes: &["RD"],
+    },
+    JetBrainsProduct {
+        data_prefix: "DataGrip",
+        comm_names: &["datagrip"],
+        product_codes: &["DG"],
+    },
+];
+
+/// 解析 JetBrains 数据目录名：产品前缀 + 20xx.N 版本号。
+/// IdeaIC1.1、Webstorm、Toolbox 这类不带年份版本号的目录返回 None。
+fn parse_jetbrains_data_dir(name: &str) -> Option<(&'static JetBrainsProduct, &str)> {
+    for product in JETBRAINS_PRODUCTS {
+        if let Some(version) = name.strip_prefix(product.data_prefix)
+            && is_jetbrains_version(version)
+        {
+            return Some((product, version));
+        }
+    }
+    None
+}
+
+fn is_jetbrains_version(value: &str) -> bool {
+    normalize_jetbrains_version(value).is_some()
+}
+
+/// "2026.1.3" → "2026.1"；非 20xx 开头（如 Android Studio 的 AI-261…）
+/// 返回 None，不参与版本比对。
+fn normalize_jetbrains_version(version: &str) -> Option<String> {
+    let (year, rest) = version.split_once('.')?;
+    if year.len() != 4 || !year.starts_with("20") || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let minor = rest.split('.').next()?;
+    if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{year}.{minor}"))
+}
+
+/// 收集本机已安装的 JetBrains 版本：/opt/jetbrains/*/product-info.json
+/// 加 Toolbox 应用目录（限深度，防深挖）。
+fn jetbrains_installed_versions() -> Vec<(&'static JetBrainsProduct, String)> {
+    let mut installed = Vec::new();
+    let mut info_paths = Vec::new();
+
+    if let Ok(entries) = fs::read_dir("/opt/jetbrains") {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("product-info.json");
+            if candidate.is_file() {
+                info_paths.push(candidate);
+            }
+        }
+    }
+    if let Some(home) = home_dir() {
+        let toolbox_apps = home.join(".local/share/JetBrains/Toolbox/apps");
+        collect_named_files(&toolbox_apps, "product-info.json", 5, &mut info_paths);
+    }
+
+    for info_path in info_paths {
+        let Ok(text) = fs::read_to_string(&info_path) else {
+            continue;
+        };
+        let (Some(code), Some(version)) = (
+            json_string_field(&text, "productCode"),
+            json_string_field(&text, "version"),
+        ) else {
+            continue;
+        };
+        let Some(normalized) = normalize_jetbrains_version(&version) else {
+            continue;
+        };
+        if let Some(product) = JETBRAINS_PRODUCTS
+            .iter()
+            .find(|product| product.product_codes.contains(&code.as_str()))
+        {
+            let entry = (product, normalized);
+            if !installed.iter().any(
+                |(existing, existing_version): &(&'static JetBrainsProduct, String)| {
+                    std::ptr::eq(*existing, product) && existing_version == &entry.1
+                },
+            ) {
+                installed.push(entry);
+            }
+        }
+    }
+
+    installed
+}
+
+fn collect_named_files(root: &Path, name: &str, depth: u8, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_named_files(&path, name, depth - 1, out);
+        } else if path.file_name().is_some_and(|file_name| file_name == name) {
+            out.push(path);
+        }
+    }
+}
+
+/// 从 JSON 文本里取字符串字段值。product-info.json 只需要浅层的
+/// productCode/version，做宽松的单行匹配即可，不引入 JSON 依赖。
+fn json_string_field(text: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\"");
+    for line in text.lines() {
+        let Some(position) = line.find(&marker) else {
+            continue;
+        };
+        let after = &line[position + marker.len()..];
+        let colon = after.find(':')?;
+        let rest = after[colon + 1..].trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        let value = &rest[..end];
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn scan_jetbrains_stale(
+    target: &CleanupTarget,
+    _options: &CleanerOptions,
+    language: Language,
+) -> ScanReport {
+    let mut report = ScanReport::new(target);
+    let Some(home) = home_dir() else {
+        report.status = ScanStatus::Unavailable;
+        report
+            .warnings
+            .push(i18n::tr(language, "未设置 HOME。", "HOME is not set.").to_string());
+        return report;
+    };
+
+    let installed = jetbrains_installed_versions();
+    let running = running_process_names();
+    let mut items = Vec::new();
+    let mut running_skipped = Vec::new();
+
+    // 元组第二项标记是不是插件目录（~/.local/share），说明文字不同。
+    let bases = [
+        (home.join(".cache/JetBrains"), false),
+        (home.join(".local/share/JetBrains"), true),
+    ];
+    for (base, is_plugin_dir) in bases {
+        let Ok(entries) = fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((product, version)) = parse_jetbrains_data_dir(&name) else {
+                continue;
+            };
+            // 版本仍安装在本机：不是清理对象。
+            if installed
+                .iter()
+                .any(|(installed_product, installed_version)| {
+                    std::ptr::eq(*installed_product, product) && installed_version == version
+                })
+            {
+                continue;
+            }
+            // 产品正在运行：检测可能有遗漏（比如非常规安装位置），
+            // 运行中一律不碰它的目录。
+            if is_process_name_running(&running, product.comm_names) {
+                running_skipped.push(entry.path());
+                continue;
+            }
+            let kind = if is_plugin_dir {
+                LocalizedText {
+                    zh_cn: "插件",
+                    en: "plugin",
+                }
+            } else {
+                LocalizedText {
+                    zh_cn: "缓存",
+                    en: "cache",
+                }
+            };
+            let path = entry.path();
+            match dir_size(&path) {
+                Ok(bytes) => items.push(ScanItem {
+                    path,
+                    bytes,
+                    entries: 1,
+                    note: Some(NoteText::owned(
+                        format!(
+                            "JetBrains IDE {version} 的{}目录，该版本已不在本机",
+                            kind.zh_cn
+                        ),
+                        format!(
+                            "JetBrains IDE {version} {} directory; this version is no longer installed",
+                            kind.en
+                        ),
+                    )),
+                    kind: ItemKind::Path,
+                }),
+                Err(error) if is_ignorable_io_error(&error) => {}
+                Err(error) => push_inspect_warning(&mut report, error, language),
+            }
+        }
+    }
+
+    for path in running_skipped {
+        report.warnings.push(format!(
+            "{}：{}",
+            i18n::tr(
+                language,
+                "该 IDE 正在运行，已跳过其数据目录",
+                "Skipped because this IDE is running"
+            ),
+            path.display()
+        ));
+    }
+
+    add_cleanable_entry_details(&mut report, items, language);
+    report.details.push(
+        i18n::tr(
+            language,
+            "设置目录（~/.config/JetBrains）不在清理范围。",
+            "Settings directories (~/.config/JetBrains) are out of scope.",
+        )
+        .to_string(),
+    );
+    report
+}
+
+fn scan_trash(target: &CleanupTarget, _options: &CleanerOptions, language: Language) -> ScanReport {
+    let mut report = ScanReport::new(target);
+    let Some(trash_dir) = home_dir().map(|path| path.join(".local/share/Trash")) else {
+        report.status = ScanStatus::Unavailable;
+        report
+            .warnings
+            .push(i18n::tr(language, "未设置 HOME。", "HOME is not set.").to_string());
+        return report;
+    };
+
+    add_dir_size(
+        &mut report,
+        &trash_dir,
+        i18n::tr(language, "回收站", "Trash"),
         language,
     );
     report
@@ -1530,6 +2799,9 @@ where
             path,
             bytes,
             entries: 1,
+            // 说明由各规则的扫描函数按条目补写（如 user-cache 的目录名说明表）。
+            note: None,
+            kind: ItemKind::Path,
         });
     }
 
@@ -1543,6 +2815,8 @@ fn cleanable_files_size(path: &Path, min_age_days: u16) -> io::Result<ScanItem> 
             path: path.to_path_buf(),
             bytes: 0,
             entries: 0,
+            note: None,
+            kind: ItemKind::Path,
         });
     }
 
@@ -1552,6 +2826,8 @@ fn cleanable_files_size(path: &Path, min_age_days: u16) -> io::Result<ScanItem> 
             path: path.to_path_buf(),
             bytes: if cleanable { metadata.len() } else { 0 },
             entries: usize::from(cleanable),
+            note: None,
+            kind: ItemKind::Path,
         });
     }
 
@@ -1592,6 +2868,8 @@ fn cleanable_files_size(path: &Path, min_age_days: u16) -> io::Result<ScanItem> 
         path: path.to_path_buf(),
         bytes: total,
         entries,
+        note: None,
+        kind: ItemKind::Path,
     })
 }
 
@@ -1615,7 +2893,18 @@ fn scan_old_downloads(
         false,
         |_| false,
     ) {
-        Ok(entries) => add_cleanable_entry_details(&mut report, entries, language),
+        Ok(mut entries) => {
+            let days = options.downloads_min_age_days;
+            for entry in &mut entries {
+                entry.note = Some(NoteText::owned(
+                    format!("下载目录中 {days} 天以上未动的文件，删除后无法恢复"),
+                    format!(
+                        "Downloads unchanged for {days}+ days; cannot be restored once removed"
+                    ),
+                ));
+            }
+            add_cleanable_entry_details(&mut report, entries, language)
+        }
         Err(error) => push_inspect_warning(&mut report, error, language),
     }
 
@@ -1735,6 +3024,8 @@ fn parse_size_path_lines(text: &str) -> Vec<ScanItem> {
                 path: PathBuf::from(path_text),
                 bytes,
                 entries: 1,
+                note: None,
+                kind: ItemKind::Path,
             })
         })
         .collect()
@@ -1928,6 +3219,8 @@ fn redundant_items_from_hashed(hashed: &[(PathBuf, u64, String)]) -> Vec<ScanIte
                 path,
                 bytes,
                 entries: 1,
+                note: None,
+                kind: ItemKind::Path,
             });
         }
     }
@@ -1976,12 +3269,18 @@ fn add_cleanable_entry_details(
     ));
 
     for entry in entries.iter().take(10) {
+        let note = entry
+            .note
+            .as_ref()
+            .map(|note| format!(" · {}", note.get(language)))
+            .unwrap_or_default();
         report.details.push(format!(
-            "{} ({}, {} {})",
+            "{} ({}, {} {}{})",
             entry.path.display(),
             format_bytes(entry.bytes),
             entry.entries,
-            i18n::tr(language, "项", "items")
+            i18n::tr(language, "项", "items"),
+            note
         ));
     }
 
@@ -2049,7 +3348,7 @@ mod tests {
         matches_temp_file_excluded_entry, matches_user_cache_excluded_name,
     };
     use crate::i18n::Language;
-    use crate::model::CleanerOptions;
+    use crate::model::{CleanerOptions, ItemKind};
     use std::collections::HashSet;
     use std::path::Path;
     use std::time::Duration;
@@ -2142,16 +3441,22 @@ mod tests {
                 path: PathBuf::from("/tmp/a"),
                 bytes: 10,
                 entries: 1,
+                note: None,
+                kind: ItemKind::Path,
             },
             ScanItem {
                 path: PathBuf::from("/tmp/a"),
                 bytes: 10,
                 entries: 1,
+                note: None,
+                kind: ItemKind::Path,
             },
             ScanItem {
                 path: PathBuf::from("/tmp/b c"),
                 bytes: 5,
                 entries: 2,
+                note: None,
+                kind: ItemKind::Path,
             },
         ];
         let target = super::item_removal_target(&items, false).unwrap();
@@ -2161,6 +3466,8 @@ mod tests {
             // argv 直传：路径带空格也只是一整个参数，不进 shell。
             assert_eq!(command.args[0], "-rf");
             assert_eq!(command.args[1], "--");
+            // display 与 argv 一致：程序名不重复。
+            assert!(command.display.starts_with("rm -rf -- "));
         }
         assert!(target.apply_commands[1].args[2].contains("b c"));
 
@@ -2174,6 +3481,8 @@ mod tests {
             path: PathBuf::from("tmp/relative"),
             bytes: 1,
             entries: 1,
+            note: None,
+            kind: ItemKind::Path,
         }];
         assert!(super::item_removal_target(&relative, false).is_err());
     }
@@ -2189,19 +3498,23 @@ mod tests {
     }
 
     #[test]
-    fn pacman_cache_dry_run_uses_single_paccache_operation() {
+    fn pacman_cache_dry_run_stays_readonly() {
         let options = CleanerOptions::default();
         let targets = all_targets(&options);
         let target = targets
             .iter()
             .find(|target| target.id == "pacman-cache")
             .unwrap();
-        let command = &target.dry_run_commands[0];
 
-        assert_eq!(command.program, "paccache");
-        assert!(command.args.contains(&"-d".to_string()));
-        assert!(command.args.contains(&"-k".to_string()));
-        assert!(!command.args.contains(&"-r".to_string()));
+        for command in &target.dry_run_commands {
+            assert_eq!(command.program, "paccache");
+            // dry-run 标志拼在第一个参数里（-k3 那条是 "-d"，未安装
+            // 包那条是 "-duk0"），共同点是不带 sudo、不动缓存。
+            assert!(command.args[0].starts_with("-d"));
+            assert!(!command.display.starts_with("sudo"));
+        }
+        let first = &target.dry_run_commands[0];
+        assert!(first.args.contains(&"-k".to_string()));
     }
 
     #[test]
@@ -2212,6 +3525,98 @@ mod tests {
 
         assert_eq!(summary.candidates, Some(42));
         assert_eq!(summary.bytes, Some(1_610_612_736));
+    }
+
+    #[test]
+    fn parses_pacman_qi_installed_sizes() {
+        let text = "Name            : 7zip\nInstalled Size  : 6.47 MiB\nDescription     : File archiver with a high compression ratio\n\nName            : firefox\nInstalled Size  : 234.5 MiB\nDescription     : Standalone web browser\n";
+        let items = super::parse_pacman_qi_sizes(text);
+
+        assert_eq!(items.len(), 2);
+        // 按体积降序
+        assert_eq!(items[0].path.display().to_string(), "firefox");
+        assert_eq!(items[0].bytes, 245_891_072);
+        assert_eq!(items[0].kind, crate::model::ItemKind::Package);
+        assert_eq!(
+            items[0]
+                .note
+                .as_ref()
+                .unwrap()
+                .get(crate::i18n::Language::En),
+            "Standalone web browser"
+        );
+        assert_eq!(items[1].path.display().to_string(), "7zip");
+    }
+
+    #[test]
+    fn package_removal_feeds_pacman_via_stdin() {
+        use crate::model::ScanItem;
+        use std::path::PathBuf;
+
+        let items = vec![
+            ScanItem {
+                path: PathBuf::from("firefox"),
+                bytes: 1,
+                entries: 1,
+                note: None,
+                kind: crate::model::ItemKind::Package,
+            },
+            ScanItem {
+                path: PathBuf::from("gimp"),
+                bytes: 1,
+                entries: 1,
+                note: None,
+                kind: crate::model::ItemKind::Package,
+            },
+        ];
+        let target = super::package_removal_target(&items).unwrap();
+        let command = &target.apply_commands[0];
+
+        assert_eq!(command.program, "sh");
+        assert!(command.needs_sudo);
+        // 包名经 stdin 喂给 pacman，不做 shell 变量展开
+        let script = &command.args[1];
+        assert!(script.contains("sudo pacman -Rns -"));
+        assert!(script.contains("'firefox' 'gimp'"));
+
+        assert!(super::package_removal_target(&[]).is_err());
+
+        // 非法包名（可能破坏脚本引号）直接拒绝
+        let evil = vec![ScanItem {
+            path: PathBuf::from("pkg'; rm -rf /"),
+            bytes: 1,
+            entries: 1,
+            note: None,
+            kind: crate::model::ItemKind::Package,
+        }];
+        let error = super::package_removal_target(&evil).unwrap_err();
+        assert!(error.contains("suspicious package name"));
+    }
+
+    #[test]
+    fn pacman_cache_now_also_prunes_uninstalled_caches() {
+        let options = CleanerOptions::default();
+        let targets = all_targets(&options);
+        let target = targets
+            .iter()
+            .find(|target| target.id == "pacman-cache")
+            .unwrap();
+
+        // 两段：-k 旧版本 + -ruk0 未安装包缓存，dry-run 和 apply 一一对应
+        assert_eq!(target.dry_run_commands.len(), 2);
+        assert_eq!(target.apply_commands.len(), 2);
+        assert!(
+            target
+                .dry_run_commands
+                .iter()
+                .any(|command| command.args.contains(&"-duk0".to_string()))
+        );
+        assert!(
+            target
+                .apply_commands
+                .iter()
+                .any(|command| command.args.contains(&"-ruk0".to_string()))
+        );
     }
 
     #[test]
@@ -2334,11 +3739,171 @@ mod tests {
             .join("\n");
 
         assert!(command_text.contains("thumbnails"));
+        assert!(command_text.contains("jetbrains"));
         assert!(command_text.contains("codex"));
         assert!(command_text.contains("claude"));
         assert!(command_text.contains("opencode"));
         assert!(command_text.contains("-not"));
         assert!(command_text.contains("-iname"));
+    }
+
+    #[test]
+    fn user_cache_script_guards_running_apps() {
+        let script = super::user_cache_script(Path::new("/home/demo/.cache"), "+30", true);
+
+        assert!(script.contains("microsoft-edge) processes='msedge'"));
+        assert!(script.contains("mozilla) processes='firefox firefox-bin firefox-esr'"));
+        assert!(script.contains("pgrep -x"));
+        assert!(script.contains("rm -rf -- \"$dir\""));
+
+        let dry_run = super::user_cache_script(Path::new("/home/demo/.cache"), "+30", false);
+        assert!(!dry_run.contains("rm -rf"));
+        assert!(dry_run.contains("printf '%s\\n' \"$dir\""));
+    }
+
+    #[test]
+    fn in_use_cache_dirs_match_running_processes() {
+        let running = vec!["msedge".to_string(), "firefox".to_string()];
+
+        assert!(super::is_process_name_running(
+            &running,
+            super::user_cache_in_use_processes("microsoft-edge").unwrap()
+        ));
+        assert!(super::is_process_name_running(
+            &running,
+            super::user_cache_in_use_processes("mozilla").unwrap()
+        ));
+        assert!(!super::is_process_name_running(
+            &running,
+            super::user_cache_in_use_processes("qq").unwrap()
+        ));
+        assert!(super::user_cache_in_use_processes("paru").is_none());
+    }
+
+    #[test]
+    fn user_cache_notes_explain_common_dirs() {
+        use crate::i18n::Language;
+
+        assert!(
+            super::user_cache_note("plasmashell")
+                .get(Language::ZhCn)
+                .contains("KDE")
+        );
+        assert!(
+            super::user_cache_note("gstreamer-1.0")
+                .get(Language::ZhCn)
+                .contains("解码")
+        );
+        assert!(
+            super::user_cache_note("microsoft-edge")
+                .get(Language::En)
+                .contains("Browser cache")
+        );
+        // 认不出的目录给通用解释，不能没有说明
+        assert!(
+            super::user_cache_note("Softdeluxe")
+                .get(Language::ZhCn)
+                .contains("XDG")
+        );
+        assert!(
+            super::user_cache_note("whatever")
+                .get(Language::En)
+                .contains("rebuild")
+        );
+    }
+
+    #[test]
+    fn jetbrains_data_dir_and_version_parsing() {
+        let (product, version) = super::parse_jetbrains_data_dir("IntelliJIdea2026.1").unwrap();
+        assert_eq!(version, "2026.1");
+        assert_eq!(product.data_prefix, "IntelliJIdea");
+
+        let (product, _) = super::parse_jetbrains_data_dir("PyCharm2025.3").unwrap();
+        assert_eq!(product.data_prefix, "PyCharm");
+
+        // 非年份版本、旧命名、非产品目录都不参与
+        assert!(super::parse_jetbrains_data_dir("IdeaIC1.1").is_none());
+        assert!(super::parse_jetbrains_data_dir("Webstorm").is_none());
+        assert!(super::parse_jetbrains_data_dir("Toolbox").is_none());
+        assert!(super::parse_jetbrains_data_dir("Daemon").is_none());
+
+        assert_eq!(
+            super::normalize_jetbrains_version("2026.1.3"),
+            Some("2026.1".to_string())
+        );
+        assert_eq!(
+            super::normalize_jetbrains_version("2025.2"),
+            Some("2025.2".to_string())
+        );
+        assert_eq!(super::normalize_jetbrains_version("AI-261.26222.65"), None);
+    }
+
+    #[test]
+    fn parses_product_info_json_fields_leniently() {
+        let pretty = "{\n  \"productCode\": \"IU\",\n  \"version\": \"2026.1.3\",\n  \"name\": \"IntelliJ IDEA\"\n}\n";
+        assert_eq!(
+            super::json_string_field(pretty, "productCode").as_deref(),
+            Some("IU")
+        );
+        assert_eq!(
+            super::json_string_field(pretty, "version").as_deref(),
+            Some("2026.1.3")
+        );
+        assert_eq!(super::json_string_field(pretty, "missing"), None);
+
+        let minified = "{\"productCode\":\"RR\",\"version\":\"2026.2.1\"}";
+        assert_eq!(
+            super::json_string_field(minified, "productCode").as_deref(),
+            Some("RR")
+        );
+    }
+
+    #[test]
+    fn jetbrains_stale_target_is_picker_only() {
+        let options = CleanerOptions::default();
+        let targets = all_targets(&options);
+        let target = targets
+            .iter()
+            .find(|target| target.id == "jetbrains-stale")
+            .unwrap();
+
+        assert!(!target.requires_sudo);
+        assert!(target.apply_commands.is_empty());
+        assert_eq!(target.dry_run_commands.len(), 2);
+    }
+
+    #[test]
+    fn dev_tool_targets_use_official_commands() {
+        let options = CleanerOptions::default();
+        let targets = all_targets(&options);
+
+        let pnpm = targets
+            .iter()
+            .find(|target| target.id == "pnpm-store")
+            .unwrap();
+        assert_eq!(pnpm.apply_commands[0].program, "pnpm");
+        assert_eq!(pnpm.apply_commands[0].args, vec!["store", "prune"]);
+        // 不提供逐条 rm：pnpm 的仓库只能由它自己清理
+        assert!(
+            pnpm.apply_commands
+                .iter()
+                .all(|command| command.program != "rm")
+        );
+
+        let gradle = targets
+            .iter()
+            .find(|target| target.id == "gradle-cache")
+            .unwrap();
+        // Gradle 是否在运行只有扫描时知道，删除只能走扫描结果页
+        assert!(gradle.apply_commands.is_empty());
+
+        let conda = targets
+            .iter()
+            .find(|target| target.id == "conda-cache")
+            .unwrap();
+        assert!(conda.apply_commands[0].args.contains(&"clean".to_string()));
+        assert!(conda.apply_commands[0].args.contains(&"--all".to_string()));
+        assert!(conda.apply_commands[0].args.contains(&"-y".to_string()));
     }
 
     #[test]

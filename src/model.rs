@@ -32,6 +32,37 @@ impl LocalizedText {
     }
 }
 
+/// 条目说明的双语文案。规则元数据用的 LocalizedText 只装字面量；
+/// 条目说明常带运行期信息（版本号、天数），用 Cow 兼容两种来源。
+#[derive(Clone, Debug)]
+pub struct NoteText {
+    pub zh_cn: std::borrow::Cow<'static, str>,
+    pub en: std::borrow::Cow<'static, str>,
+}
+
+impl NoteText {
+    pub fn from_static(text: LocalizedText) -> Self {
+        Self {
+            zh_cn: std::borrow::Cow::Borrowed(text.zh_cn),
+            en: std::borrow::Cow::Borrowed(text.en),
+        }
+    }
+
+    pub fn owned(zh_cn: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            zh_cn: std::borrow::Cow::Owned(zh_cn.into()),
+            en: std::borrow::Cow::Owned(en.into()),
+        }
+    }
+
+    pub fn get(&self, language: Language) -> &str {
+        match language {
+            Language::ZhCn => &self.zh_cn,
+            Language::En => &self.en,
+        }
+    }
+}
+
 impl Default for CleanerOptions {
     fn default() -> Self {
         Self {
@@ -158,13 +189,26 @@ impl fmt::Display for ScanStatus {
     }
 }
 
-/// 扫描发现的单个可清理条目（一个顶层目录或文件）。
+/// 条目清理方式：删文件路径，还是卸载软件包。
+/// 大体积包清单等目标的条目是包名，清理走 pacman 而不是 rm。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemKind {
+    Path,
+    Package,
+}
+
+/// 扫描发现的单个可清理条目（一个顶层目录或文件，或一个软件包）。
 /// 文件选择器以它为数据源，clean 只删除用户勾选的条目。
+/// note 是这个条目的人话说明（双语，显示时按界面语言解析）：
+/// 告诉用户这是什么缓存、删了有什么影响，目录名本身对使用者
+/// 没有信息量。
 #[derive(Clone, Debug)]
 pub struct ScanItem {
     pub path: PathBuf,
     pub bytes: u64,
     pub entries: usize,
+    pub note: Option<NoteText>,
+    pub kind: ItemKind,
 }
 
 #[derive(Clone, Debug)]
